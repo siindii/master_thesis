@@ -1,0 +1,876 @@
+---
+title: "Fujita_maybefinal"
+format: html
+editor: visual
+---
+
+# Fujita2023
+
+Library loading
+
+```{r}
+library(rTensor)
+library(tidyr)
+library(parafac4microbiome)
+library(zinbwave)
+library(ggplot2)
+library(ggpubr)
+library(reshape2)
+library(SummarizedExperiment)
+library(dplyr)
+library(SingleCellExperiment)
+library(gridExtra)
+library(viridis)
+library(stringr)
+library(MASS)
+library(scales)
+library(plotly)
+library(pheatmap)
+library(RColorBrewer)
+library(tibble)
+library(grid)
+
+set.seed(111)
+```
+
+### Sparsity preprocessing and unfolding into 2D matrix
+
+```{r}
+Fujita_sparsityprocessedCube <- processDataCube(Fujita2023, sparsityThreshold=0.99, CLR = FALSE, centerMode = FALSE, scaleMode = FALSE)
+
+Fujita_mode1 <- Fujita_sparsityprocessedCube$mode1
+Fujita_mode2 <- Fujita_sparsityprocessedCube$mode2
+Fujita_mode3 <- Fujita_sparsityprocessedCube$mode3
+
+Fujita_tensor <- as.tensor(Fujita_sparsityprocessedCube$data)
+
+#unfolding along mode 1 (subject) and 3 (time) for rows, and mode 2 (taxa) for columns
+#matrix w each row = subject-time combination + each column = a taxon
+Fujita_unfolded_tensor <- unfold(Fujita_tensor, row_idx = c(1, 3), col_idx = 2)
+
+#from unfolded tensor to matrix
+Fujita_matrix <- Fujita_unfolded_tensor@data
+
+#row names combining replicate.id and time point
+Fujita_row_names <- apply(expand.grid(Fujita_mode1$replicate.id, Fujita_mode3$time), 1, paste, collapse = "_")
+rownames(Fujita_matrix) <- Fujita_row_names
+
+#taxon IDs from mode2 as column names
+colnames(Fujita_matrix) <- Fujita_mode2$ID
+```
+
+### zinbFit
+
+```{r}
+#transposing the matrix so taxa are rows and replicates are columns
+Fujita_Y_matrix <- t(Fujita_matrix)
+
+#Fit ZINB model
+Fujita_zinb_model_1 <- zinbFit(
+  Y = Fujita_Y_matrix, 
+  #X = design_matrix,
+  K = 0,
+  #epsilon = 1e12, 
+  maxiter.optimize = 500, 
+  verbose = TRUE,
+  commondispersion = TRUE,
+  zeroinflation = TRUE,
+  BPPARAM = BiocParallel::SerialParam()
+)
+
+print(Fujita_zinb_model_1)
+```
+
+```{r}
+#getting model estimates for mu and pi
+Fujita_mu_values1 <- getMu(Fujita_zinb_model_1)
+Fujita_pi_values1 <- getPi(Fujita_zinb_model_1)
+
+
+#Y_matrix_retransposed <- t(Fujita_Y_matrix)
+
+Fujita_residuals1 <- computeDevianceResiduals(Fujita_zinb_model_1, Fujita_matrix)
+
+rownames(Fujita_pi_values1) <- Fujita_row_names
+colnames(Fujita_pi_values1) <- Fujita_mode2$ID
+
+#converting the pi_values matrix back into a tensor
+Fujita_pi_tensor <- rTensor::fold(as.matrix(Fujita_pi_values1),
+                      row_idx = c(1, 3),   #mode 1, replicates and mode 3, time in the rows
+                      col_idx = 2,         #mode 2, taxa in the columns
+                      modes = c(8,23,110))
+# dim(Fujita_pi_tensor)
+# print(class(Fujita_pi_tensor))
+```
+
+### Tensor multiplication, centering and scaling
+
+```{r}
+Fujita_CLRprocessedCube <- processDataCube(Fujita_sparsityprocessedCube, CLR = TRUE, centerMode = FALSE, scaleMode = FALSE)
+
+Fujita_pi_tensor <- as.tensor(Fujita_pi_tensor@data)
+Fujita_CLR_cube <- as.tensor(Fujita_CLRprocessedCube$data) 
+
+
+Fujita_data_data <- (1- Fujita_pi_tensor) * Fujita_CLR_cube
+
+
+Fujita_data_list <- list(
+    data = Fujita_data_data, 
+    mode1 = Fujita_mode1,
+    mode2 = Fujita_mode2, 
+    mode3 = Fujita_mode3  
+)
+
+
+#multiwaycenter + scale 
+Fujita_center_data <- multiwayCenter(Fujita_data_list$data, mode = 1)
+
+Fujita_preprocessed_data <- multiwayScale(Fujita_center_data, mode = 2)
+
+print(Fujita_preprocessed_data[,1,1])
+
+Fujita_data_list <- list(
+    data = Fujita_preprocessed_data, 
+    mode1 = Fujita_mode1,
+    mode2 = Fujita_mode2, 
+    mode3 = Fujita_mode3  
+)
+```
+
+### ZINB PARAFAC
+
+```{r}
+
+set.seed(111)
+# Setup
+minNumComponents = 1
+maxNumComponents = 6
+numRepetitions = 5 # number of randomly initialized models
+numFolds = 8 # number of jack-knifed models
+ctol = 1e-12
+maxit = 200
+numCores= 1
+
+
+#metrics to determine the correct number of components
+Fujita_qualityAssessment = assessModelQuality(Fujita_preprocessed_data, minNumComponents, maxNumComponents, numRepetitions, ctol=ctol, maxit=maxit, numCores=numCores)
+
+```
+
+```{r}
+print(Fujita_qualityAssessment)
+```
+
+CORCONDIA scores
+
+```{r}
+Fujita_qualityAssessment$metrics$CORCONDIA
+```
+
+Stability assessments
+
+```{r}
+Fujita_stabilityAssessment = assessModelStability(Fujita_data_list, minNumComponents, maxNumComponents)
+
+print(Fujita_stabilityAssessment)
+```
+
+ZINB PARAFAC plot
+
+```{r}
+# Plot settings
+colourCols = c("", "Genus", "")
+legendTitles = c("", "Genus", "")
+xLabels = c("Replicate", "Feature index", "Time point")
+legendColNums = c(0,10,0)
+arrangeModes = c(FALSE, TRUE, FALSE)
+continuousModes = c(FALSE,FALSE,TRUE)
+
+
+numComponents = 3
+Fujita_modelChoice = which(Fujita_qualityAssessment$metrics$varExp[,numComponents] == max(Fujita_qualityAssessment$metrics$varExp[,numComponents]))
+Fujita_finalModel = Fujita_qualityAssessment$models[[numComponents]][[Fujita_modelChoice]]
+
+set.seed(111)
+plotPARAFACmodel(Fujita_finalModel$Fac, Fujita_data_list, 3, colourCols, legendTitles, xLabels, legendColNums, arrangeModes,
+  continuousModes = c(FALSE,FALSE,TRUE),
+  overallTitle = "Fujita ZINB-PARAFAC model")
+```
+
+Flipping
+
+```{r}
+Fujita_finalModel$Fac[[1]][,2] = -1 * Fujita_finalModel$Fac[[1]][,2] # mode 1 component 2
+Fujita_finalModel$Fac[[3]][,2] = -1 * Fujita_finalModel$Fac[[3]][,2] # mode 3 component 2
+#
+Fujita_finalModel$Fac[[1]][,3] = -1 * Fujita_finalModel$Fac[[1]][,3] # mode 1 component 3
+Fujita_finalModel$Fac[[3]][,3] = -1 * Fujita_finalModel$Fac[[3]][,3] # mode 3 component 3
+
+# Fujita_finalModel$Fac[[1]][,3] = -1 * Fujita_finalModel$Fac[[1]][,3] # mode 1 component 3
+# Fujita_finalModel$Fac[[2]][,3] = -1 * Fujita_finalModel$Fac[[2]][,3] # mode 2 component 3
+```
+
+Variance Explained
+
+```{r}
+Fujita_finalModel$varExp
+```
+
+# parafac4microbiome Fujita2023
+
+As done in https://grvanderploeg.com/parafac4microbiome/articles/Fujita2023_analysis.html
+
+```{r}
+processedFujita = processDataCube(Fujita2023, sparsityThreshold=0.99, CLR=TRUE, centerMode=1, scaleMode=2)
+
+set.seed(111)
+# Setup
+minNumComponents = 1
+maxNumComponents = 6
+numRepetitions = 5 # number of randomly initialized models
+numFolds = 8 # number of jack-knifed models
+ctol = 1e-12
+maxit = 200
+numCores= 1
+
+
+# Plot settings
+colourCols = c("", "Genus", "")
+legendTitles = c("", "Genus", "")
+xLabels = c("Replicate", "Feature index", "Time point")
+legendColNums = c(0,5,0)
+arrangeModes = c(FALSE, TRUE, FALSE)
+continuousModes = c(FALSE,FALSE,TRUE)
+
+# Assess the metrics to determine the correct number of components
+Fujita_p4m_qualityAssessment = assessModelQuality(processedFujita$data, minNumComponents, maxNumComponents, numRepetitions, ctol=ctol, maxit=maxit, numCores=numCores)
+
+Fujita_p4m_qualityAssessment$plots$overview
+
+```
+
+```{r}
+Fujita_p4m_qualityAssessment$metrics$CORCONDIA
+```
+
+```{r}
+Fujita_p4m_stabilityAssessment = assessModelStability(processedFujita, minNumComponents=1, maxNumComponents=5, numFolds=numFolds, considerGroups=FALSE,
+                                           groupVariable="", colourCols, legendTitles, xLabels, legendColNums, arrangeModes,
+                                           ctol=ctol, maxit=maxit, numCores=numCores)
+Fujita_p4m_stabilityAssessment$modelPlots[[1]]
+
+Fujita_p4m_stabilityAssessment$modelPlots[[2]]
+
+Fujita_p4m_stabilityAssessment$modelPlots[[3]]
+
+Fujita_p4m_stabilityAssessment$modelPlots[[4]]
+```
+
+```{r}
+numComponents = 3
+modelChoice = which(Fujita_p4m_qualityAssessment$metrics$varExp[,numComponents] == max(Fujita_p4m_qualityAssessment$metrics$varExp[,numComponents]))
+originalModel_Fujita = Fujita_p4m_qualityAssessment$models[[numComponents]][[modelChoice]]
+
+plotPARAFACmodel(originalModel_Fujita$Fac, processedFujita, 3, colourCols, legendTitles, xLabels, legendColNums, arrangeModes,
+  continuousModes = c(FALSE,FALSE,TRUE),
+  overallTitle = "Fujita PARAFAC model")
+```
+
+```{r}
+originalModel_Fujita$varExp
+```
+
+```{r}
+originalModel_Fujita = flipLoadings(originalModel_Fujita, processedFujita$data)
+
+plotPARAFACmodel(originalModel_Fujita$Fac, processedFujita, 3, colourCols, legendTitles, xLabels, legendColNums, arrangeModes,
+  continuousModes = c(FALSE,FALSE,TRUE),
+  overallTitle = "Fujita PARAFAC model")
+```
+
+# Canonical Correlation Analysis
+
+```{r}
+#mode loadings selection
+subject_loadings_original_Fujita <- originalModel_Fujita$Fac[[1]]  
+subject_loadings_zinb_Fujita <- Fujita_finalModel$Fac[[1]]
+
+feat_loadings_original_Fujita <- originalModel_Fujita$Fac[[2]]  
+feat_loadings_zinb_Fujita <- Fujita_finalModel$Fac[[2]]
+
+time_loadings_original_Fujita <- originalModel_Fujita$Fac[[3]]  
+time_loadings_zinb_Fujita <- Fujita_finalModel$Fac[[3]]
+```
+
+```{r}
+#CCA for each mode
+cca_subjects <- cancor(subject_loadings_original_Fujita, subject_loadings_zinb_Fujita)
+cca_features <- cancor(feat_loadings_original_Fujita, feat_loadings_zinb_Fujita)
+cca_time <- cancor(time_loadings_original_Fujita, time_loadings_zinb_Fujita)
+
+#plot settings
+par(mfrow = c(1, 1))  # Arrange plots in a row with custom margins
+
+#subjects mode
+Fujita_subject_variates_original <- subject_loadings_original_Fujita %*% cca_subjects$xcoef
+Fujita_subject_variates_zinb <- subject_loadings_zinb_Fujita %*% cca_subjects$ycoef
+plot(Fujita_subject_variates_original[, 1], Fujita_subject_variates_zinb[, 1],
+     xlab = "p4m PARAFAC",
+     ylab = "ZINB-PARAFAC",
+     main = "Subjects Mode",
+     pch = 16, col = "pink", cex = 1.2) 
+abline(a = 0, b = 1, col = "red", lwd = 2, lty = 2)  
+
+#features mode
+Fujita_feature_variates_original <- feat_loadings_original_Fujita %*% cca_features$xcoef
+Fujita_feature_variates_zinb <- feat_loadings_zinb_Fujita %*% cca_features$ycoef
+plot(Fujita_feature_variates_original[, 1], Fujita_feature_variates_zinb[, 1],
+     xlab = "p4m PARAFAC",
+     ylab = "ZINB-PARAFAC",
+     main = "Features Mode",
+     pch = 16, col = "darkgreen", cex = 1.2) 
+abline(a = 0, b = 1, col = "red", lwd = 2, lty = 2) 
+
+
+#time mode
+Fujita_time_variates_original <- time_loadings_original_Fujita %*% cca_time$xcoef
+Fujita_time_variates_zinb <- time_loadings_zinb_Fujita %*% cca_time$ycoef
+plot(Fujita_time_variates_original[, 1], Fujita_time_variates_zinb[, 1],
+     xlab = "p4m PARAFAC",
+     ylab = "ZINB-PARAFAC",
+     main = "Time Mode",
+     pch = 16, col = "skyblue", cex = 1.2)
+abline(a = 0, b = 1, col = "red", lwd = 2, lty = 2)  
+
+```
+
+### Global Tucker congruence score across modes and components
+
+```{r}
+#' Compute Factor Match Score for two models.
+
+
+FMS_random = function(Fac1, Fac2){
+
+  # Make robust towards 1-component case
+  Fac1 = lapply(Fac1, as.matrix)
+  Fac2 = lapply(Fac2, as.matrix)
+
+  # Setup
+  numComponents = ncol(Fac1[[1]])
+  numModes = length(Fac1)
+
+  stopifnot(length(Fac1) == length(Fac2))
+
+  FMSresult = matrix(1L, nrow=numComponents, ncol=numComponents)
+  for(i in 1:numModes){
+    similarityMatrix = matrix(0L, nrow=numComponents, ncol=numComponents)
+
+    for(j in 1:numComponents){
+      for(k in 1:numComponents){
+        vect1 = as.matrix(Fac1[[i]][,j])
+        vect2 = as.matrix(Fac2[[i]][,k])
+        similarityMatrix[j,k] = abs(t(vect1) %*% vect2) / (norm(vect1, "F") * norm(vect2, "F"))
+      }
+    }
+    FMSresult = FMSresult * similarityMatrix
+  }
+
+  # Find best combination
+  mapping = clue::solve_LSAP(FMSresult, maximum=TRUE)
+
+  # Find mapping matrix and calculate FMS
+  mappingMatrix = cbind(seq_along(mapping), mapping)
+
+  result = (sum(FMSresult[mappingMatrix])) / numComponents
+
+  return(result)
+}
+
+
+
+Fujita_Fac1 <- originalModel_Fujita$Fac[1:3]  
+Fujita_Fac2 <- Fujita_finalModel$Fac[1:3]        
+
+Fujita_fms_score <- FMS_random(Fujita_Fac1, Fujita_Fac2)
+
+print(Fujita_fms_score)
+
+```
+
+### Tucker Congruence Coefficient Heatmap
+
+```{r}
+calculateTCC = function(vect1, vect2){
+vect1 = as.matrix(vect1)
+vect2 = as.matrix(vect2)
+FMS = abs(t(vect1) %*% vect2) / (norm(vect1, "F") * norm(vect2, "F"))
+return(FMS)
+}
+```
+
+```{r}
+compute_tcc_matrix <- function(mat1, mat2) {
+  n1 <- ncol(mat1)
+  n2 <- ncol(mat2)
+  tcc_mat <- matrix(NA, nrow = n1, ncol = n2)
+  for (i in 1:n1) {
+    for (j in 1:n2) {
+      tcc_mat[i, j] <- calculateTCC(mat1[, i], mat2[, j])
+    }
+  }
+  rownames(tcc_mat) <- paste0("parafac4microbiome_", 1:n1)
+  colnames(tcc_mat) <- paste0("ZINB-WaVe_", 1:n2)
+  return(tcc_mat)
+}
+
+```
+
+```{r}
+#calculate TCC matrices
+subject_tcc_matrix <- compute_tcc_matrix(subject_loadings_original_Fujita, subject_loadings_zinb_Fujita)
+feature_tcc_matrix <- compute_tcc_matrix(feat_loadings_original_Fujita, feat_loadings_zinb_Fujita)
+time_tcc_matrix    <- compute_tcc_matrix(time_loadings_original_Fujita, time_loadings_zinb_Fujita)
+
+
+pheatmap(subject_tcc_matrix,
+         cluster_rows = FALSE, cluster_cols = FALSE,
+         main = "TCC Heatmap - Subject Mode", display_numbers = TRUE, 
+         color = colorRampPalette(c("white", "pink2"))(50))
+
+pheatmap(feature_tcc_matrix,
+         cluster_rows = FALSE, cluster_cols = FALSE,
+         main = "TCC Heatmap - Feature Mode", display_numbers = TRUE, 
+         color = colorRampPalette(c("white", "darkgreen"))(50))
+
+pheatmap(time_tcc_matrix,
+         cluster_rows = FALSE, cluster_cols = FALSE,
+         main = "TCC Heatmap - Time Mode", display_numbers = TRUE, 
+         color = colorRampPalette(c("white", "skyblue"))(50))
+
+```
+
+```{r}
+
+plot_tcc_panels <- function(subject_orig, subject_zinb,
+                            feature_orig, feature_zinb,
+                            time_orig, time_zinb,
+                            dataset = "Fujita2023") {
+
+  #TCC matrices
+  subject_tcc <- compute_tcc_matrix(subject_orig, subject_zinb)
+  feature_tcc <- compute_tcc_matrix(feature_orig, feature_zinb)
+  time_tcc    <- compute_tcc_matrix(time_orig,    time_zinb)
+
+  #long format (x = p4m, y = ZINB)
+  to_long <- function(mat, mode_label, p4m_levels = rownames(mat), zinb_levels = colnames(mat)) {
+    as.data.frame(mat) %>%
+      rownames_to_column("p4m") %>%
+      pivot_longer(-p4m, names_to = "ZINB", values_to = "TCC") %>%
+      mutate(
+        Mode = mode_label,
+        p4m  = factor(p4m,  levels = p4m_levels),
+        ZINB = factor(ZINB, levels = rev(zinb_levels))  # show _1 at top
+      )
+  }
+
+  df_subj <- to_long(subject_tcc, "Subjects")
+  df_feat <- to_long(feature_tcc, "Features")
+  df_time <- to_long(time_tcc,    "Time")
+
+  #per-mode panel
+  make_panel <- function(df_mode, title, high_col) {
+    rng <- range(df_mode$TCC, na.rm = TRUE)
+    ggplot(df_mode, aes(x = p4m, y = ZINB, fill = TCC)) +
+      geom_tile(color = "white", linewidth = 0.8) +
+      geom_text(aes(label = sprintf("%.2f", TCC)),
+                size = 4, fontface = "bold", color = "grey10") +
+      scale_fill_gradient(low = "white", high = high_col, limits = rng, name = "TCC") +
+      scale_x_discrete(labels = function(l) sub(".*_(\\d+)$", "\\1", l)) +
+      scale_y_discrete(labels = function(l) sub(".*_(\\d+)$", "\\1", l)) +
+      coord_fixed() +
+      labs(title = title, x = "parafac4microbiome component", y = "ZINB-WaVe component") +
+      theme_minimal(base_size = 12) +
+      theme(
+        panel.grid = element_blank(),
+        plot.title = element_text(face = "bold", hjust = 0.5),
+        axis.text.x = element_text(angle = 0, vjust = 0.5),
+        legend.position = "none"
+      )
+  }
+
+  p_subj <- make_panel(df_subj, "Subjects", "#CC79A7")
+  p_feat <- make_panel(df_feat, "Features", "#009E73")
+  p_time <- make_panel(df_time, "Time",     "#56B4E9")
+
+  (p_subj | p_feat | p_time) +
+    plot_annotation(title = paste0("TCC heatmaps — ", dataset)) &
+    theme(plot.title = element_text(face = "bold", size = 14, hjust = 0.5))
+}
+
+#run
+plot_tcc_panels(
+  subject_loadings_original_Fujita, subject_loadings_zinb_Fujita,
+  feat_loadings_original_Fujita,    feat_loadings_zinb_Fujita,
+  time_loadings_original_Fujita,    time_loadings_zinb_Fujita,
+  dataset = "Fujita2023"
+)
+```
+
+# Plots
+
+mu and pi values
+
+```{r}
+hist(Fujita_residuals1, breaks = 40, main = "Histogram of Deviance Residuals in Fujita2023", xlab = "Residuals", col = "skyblue")
+
+hist(Fujita_pi_values1, breaks = 40, main = "Histogram of Zero Inflation Probabilities in Fujita2023 ", xlab = "Probability of excess zero (π)", col = "orange")
+```
+
+density plot
+
+```{r}
+#masks for zero and non-zero values in Fujita_matrix
+Fujita_zero_mask <- Fujita_matrix == 0
+Fujita_non_zero_mask <- Fujita_matrix != 0
+
+#filter corresponding values 
+Fujita_pi_values_zeros1 <- Fujita_pi_values1[Fujita_zero_mask]
+Fujita_pi_values_non_zeros1<- Fujita_pi_values1[Fujita_non_zero_mask]
+
+#new data frame
+Fujita_plot_data1 <- data.frame(
+  value = c(Fujita_pi_values_zeros1, Fujita_pi_values_non_zeros1),
+  group = factor(c(rep("Zero counts", length(Fujita_pi_values_zeros1)),
+                   rep("Non-zero counts", length(Fujita_pi_values_non_zeros1))))
+)
+
+#density plot
+ggplot(Fujita_plot_data1, aes(x = value, fill = group)) +
+  geom_density(alpha = 0.5) + 
+  labs(title = "Density Plot of π values in Fujita2023",
+       x = " π ",
+       y = "Density") +
+  theme_minimal() +
+  scale_fill_manual(values = c("Zero counts" = "#00AFBB", "Non-zero counts" = "#E7B800"))+
+  theme(plot.title = element_text(hjust = 0.5))
+```
+
+Observed vs Simulated Zeros
+
+```{r}
+
+Fujita_observed_zeros <- rowSums(Fujita_matrix == 0)
+simulated_Fujita <- zinbSim(Fujita_zinb_model_1)
+Fujita_simulated_counts1 <- as.data.frame(simulated_Fujita$counts)
+Fujita_simulated_counts1 <-t(Fujita_simulated_counts1)
+Fujita_simulated_zeros1 <- rowSums(Fujita_simulated_counts1 == 0)
+
+#linear model fit
+Fujita_zero_fit <- lm(Fujita_simulated_zeros1 ~ Fujita_observed_zeros)
+
+#summary to get R-squared and p-value
+summary(Fujita_zero_fit)
+
+#extract values
+Fujita_fit_summary <- summary(Fujita_zero_fit)
+Fujita_r_squared <- round(Fujita_fit_summary$r.squared, 3)
+Fujita_p_value <- signif(Fujita_fit_summary$coefficients[2, 4], 3)
+
+#plot with annotation
+plot(Fujita_observed_zeros, Fujita_simulated_zeros1,
+     main = "Observed vs Simulated Zeros in Fujita2023",
+     xlab = "Observed Zeros", ylab = "Simulated Zeros")
+abline(0, 1, col = "blue") #reference line
+abline(Fujita_zero_fit, col = "red", lty = 2)  #regression line
+legend("topleft",
+       legend = paste0("R² = ", Fujita_r_squared, "\nP = ", Fujita_p_value),
+       bty = "n")
+```
+
+```{r}
+set.seed(123) 
+
+# number of simulations
+n_sims <- 50
+
+# observed zeros per sample
+Fujita_observed_zeros <- rowSums(Fujita_matrix == 0)
+
+# run multiple simulations and collect zeros per sample
+simulated_list <- replicate(n_sims, {
+  sim <- zinbSim(Fujita_zinb_model_1)
+  sim_counts <- t(as.data.frame(sim$counts))
+  rowSums(sim_counts == 0)
+}, simplify = "matrix")
+
+# average simulated zeros per sample across sims
+Fujita_simulated_zeros_avg <- rowMeans(simulated_list)
+
+# linear model fit
+Fujita_zero_fit_avg <- lm(Fujita_simulated_zeros_avg ~ Fujita_observed_zeros)
+Fujita_fit_summary <- summary(Fujita_zero_fit_avg)
+
+
+Fujita_r_squared <- round(Fujita_fit_summary$r.squared, 3)
+Fujita_p_value   <- signif(Fujita_fit_summary$coefficients[2, 4], 3)
+
+
+plot(Fujita_observed_zeros, Fujita_simulated_zeros_avg,
+     main = "Observed vs Averaged Simulated Zeros (50 sims) - Fujita2023",
+     xlab = "Observed Zeros per Sample",
+     ylab = "Simulated Zeros per Sample (averaged over 50 sims)")
+abline(0, 1, col = "blue")                # reference 1:1 line
+abline(Fujita_zero_fit_avg, col = "red", lty = 2)  # regression line
+legend("topleft",
+       legend = paste0("R² = ", Fujita_r_squared, "\nP = ", Fujita_p_value),
+       bty = "n")
+
+```
+
+```{r}
+n_subj   <- dim(Fujita_sparsityprocessedCube$data)[1]
+n_feat   <- dim(Fujita_sparsityprocessedCube$data)[2]
+n_time   <- dim(Fujita_sparsityprocessedCube$data)[3]
+
+
+coords_Fujita <- expand.grid(
+  subject = seq_len(n_subj),
+  feature = seq_len(n_feat),
+  time    = seq_len(n_time)
+)
+
+
+coords_Fujita$counts <- as.vector(Fujita_sparsityprocessedCube$data)
+coords_Fujita$pi <- as.vector(Fujita_pi_tensor@data)
+
+
+zeros_fujita <- subset(coords_Fujita, counts == 0)
+
+
+plot_ly(
+  data = zeros_fujita,
+  x = ~subject,
+  y = ~feature,
+  z = ~time,
+  color = ~pi,  # continuous color scale by pi
+  type = "scatter3d",
+  mode = "markers",
+  marker = list(size = 3)
+) %>% 
+plotly::layout(
+  scene = list(
+    xaxis = list(title = "Subject"),
+    yaxis = list(title = "Feature"),
+    zaxis = list(title = "Time")
+  ),
+  title = "Zero Counts Colored by ZINB pi - Fujita2023"
+)
+
+
+```
+
+Final grid plot
+
+```{r}
+
+# Component names
+comp_names <- paste0("Comp", seq_len(ncol(Fujita_finalModel$Fac[[2]])))
+
+# 1) Replicates  (mode 1)
+fujita_samples <- as_tibble(Fujita_finalModel$Fac[[1]], .name_repair = "minimal") %>%
+  setNames(comp_names) %>%
+  mutate(Sample = row_number()) %>%
+  mutate(across(all_of(comp_names), as.numeric))
+
+# 2) Taxa (mode 2) + Genus metadata (ensure character)
+fujita_taxa <- as_tibble(Fujita_finalModel$Fac[[2]], .name_repair = "minimal") %>%
+  setNames(comp_names) %>%
+  mutate(Genus = as.character(Fujita_mode2$Genus)) %>%
+  mutate(Genus = ifelse(is.na(Genus) | Genus == "", "Unclassified", Genus)) %>%
+  mutate(across(all_of(comp_names), as.numeric))
+
+# Consistent color map for all genera (used in feature plots + legend)
+all_genera <- sort(unique(fujita_taxa$Genus))
+pal <- colorRampPalette(brewer.pal(12, "Paired"))
+genus_cols <- setNames(pal(length(all_genera)), all_genera)
+
+# 3) Time (mode 3)
+fujita_time <- as_tibble(Fujita_finalModel$Fac[[3]], .name_repair = "minimal") %>%
+  setNames(comp_names) %>%
+  mutate(Timestep = row_number()) %>%
+  mutate(across(all_of(comp_names), as.numeric))
+
+
+# ----------------------- Replicate mode -----------------------
+p_samp1 <- ggplot(fujita_samples, aes(x = factor(Sample), y = Comp1)) +
+  geom_col(fill = "#6e95b5") +
+  labs(title = "Component 1", x = "Replicate", y = "Loading") +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "none",
+        plot.title = element_text(hjust = 0.5))
+
+p_samp2 <- ggplot(fujita_samples, aes(x = factor(Sample), y = Comp2)) +
+  geom_col(fill = "#6e95b5") +
+  labs(title = "Component 2", x = "Replicate", y = "Loading") +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "none",
+        plot.title = element_text(hjust = 0.5))
+
+p_samp3 <- ggplot(fujita_samples, aes(x = factor(Sample), y = Comp3)) +
+  geom_col(fill = "#6e95b5") +
+  labs(title = "Component 3", x = "Replicate", y = "Loading") +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "none",
+        plot.title = element_text(hjust = 0.5))
+
+# --- Taxa/Feature mode (Genus labels on y, color by Genus) ---
+fujita_taxa <- as_tibble(Fujita_finalModel$Fac[[2]], .name_repair = "minimal") %>%
+  setNames(comp_names) %>%
+  mutate(
+    Genus = as.character(Fujita_mode2$Genus)
+  ) %>%
+  mutate(
+    Genus = ifelse(is.na(Genus) | Genus == "", "Unclassified", Genus)
+  ) %>%
+  mutate(across(all_of(comp_names), as.numeric))
+
+#Fix  15-level mapping
+genus_levels <- sort(unique(fujita_taxa$Genus)) 
+fujita_taxa$Genus <- factor(fujita_taxa$Genus, levels = genus_levels)
+
+#Palette
+pal <- colorRampPalette(RColorBrewer::brewer.pal(12, "Paired"))
+genus_cols <- setNames(pal(length(genus_levels)), genus_levels)
+
+get_top_bottom <- function(df, comp, n = 10) {
+  top <- df %>% arrange(desc(.data[[comp]])) %>% slice_head(n = n)
+  bot <- df %>% arrange(.data[[comp]])        %>% slice_head(n = n)
+  bind_rows(top, bot) %>% arrange(.data[[comp]])
+}
+
+make_taxa_panel <- function(sub, comp_label) {
+  sub %>%
+    mutate(loading = .data[[comp_label]]) %>%
+    arrange(desc(loading)) %>%
+    mutate(label = factor(Genus, levels = rev(unique(Genus)))) %>%
+    ggplot(aes(x = loading, y = label, fill = Genus)) +
+    geom_col(width = 0.8) +
+    labs(title = paste("Component", sub("^Comp", "", comp_label)),
+         x = "Loadings", y = NULL, fill = "Genus") +
+    #same global mapping used everywhere
+    scale_fill_manual(values = genus_cols, drop = FALSE) +
+    theme_minimal(base_size = 12) +
+    theme(plot.title = element_text(hjust = 0.5),
+          axis.text.y = element_text(hjust = 1))
+}
+
+taxa_sub1 <- get_top_bottom(fujita_taxa, "Comp1", 10)
+taxa_sub2 <- get_top_bottom(fujita_taxa, "Comp2", 10)
+taxa_sub3 <- get_top_bottom(fujita_taxa, "Comp3", 10)
+
+p_taxa1 <- make_taxa_panel(taxa_sub1, "Comp1") + theme(legend.position = "none")
+p_taxa2 <- make_taxa_panel(taxa_sub2, "Comp2") + theme(legend.position = "none")
+p_taxa3 <- make_taxa_panel(taxa_sub3, "Comp3") + theme(legend.position = "none")
+
+#shared legend with all 15 genera
+
+#n generain the mapping
+n_g <- length(genus_levels)
+
+#3 rows; compute columns to fit everything
+legend_rows <- 3
+legend_cols <- ceiling(n_g / legend_rows)  # ensures rows*cols >= n_g
+
+
+legend_plot <- ggplot(
+  data = tibble(Genus = factor(genus_levels, levels = genus_levels), y = 1),
+  aes(Genus, y, fill = Genus)
+) +
+  geom_col() +
+  scale_fill_manual(values = genus_cols, drop = FALSE) +
+  guides(fill = guide_legend(
+    title = "Genus",
+    nrow = legend_rows, ncol = legend_cols, byrow = TRUE,
+    override.aes = list(alpha = 1)
+  )) +
+  theme_minimal() +
+  theme(
+    legend.position   = "bottom",
+    legend.direction  = "horizontal",
+    legend.box        = "vertical",
+    legend.key.size   = unit(5, "mm"),
+    legend.key.width  = unit(8, "mm"),
+    legend.title      = element_text(size = 9),
+    legend.text       = element_text(size = 8)
+  ) +
+  labs(x = NULL, y = NULL)
+
+shared_legend <- cowplot::get_legend(legend_plot)
+
+# ----------------------- Time mode -----------------------
+p_time1 <- ggplot(fujita_time, aes(x = Timestep, y = Comp1)) +
+  geom_line(color = "#377EB8", size = 1.2) +
+  geom_point(color = "#377EB8", size = 2) +
+  labs(title = "Component 1", x = "Time Point", y = "Loading") +
+  theme_minimal(base_size = 12) +
+  theme(plot.title = element_text(hjust = 0.5))
+
+p_time2 <- ggplot(fujita_time, aes(x = Timestep, y = Comp2)) +
+  geom_line(color = "#377EB8", size = 1.2) +
+  geom_point(color = "#377EB8", size = 2) +
+  labs(title = "Component 2", x = "Time Point", y = "Loading") +
+  theme_minimal(base_size = 12) +
+  theme(plot.title = element_text(hjust = 0.5))
+
+p_time3 <- ggplot(fujita_time, aes(x = Timestep, y = Comp3)) +
+  geom_line(color = "#377EB8", size = 1.2) +
+  geom_point(color = "#377EB8", size = 2) +
+  labs(title = "Component 3", x = "Time Point", y = "Loading") +
+  theme_minimal(base_size = 12) +
+  theme(plot.title = element_text(hjust = 0.5))
+
+
+
+#Arrange
+grid.arrange(
+  textGrob("Replicate mode", gp = gpar(fontsize = 14, fontface = "bold")),
+  textGrob("Taxa mode",      gp = gpar(fontsize = 14, fontface = "bold")),
+  textGrob("Time mode",      gp = gpar(fontsize = 14, fontface = "bold")),
+  p_samp1, p_taxa1, p_time1,
+  p_samp2, p_taxa2, p_time2,
+  p_samp3, p_taxa3, p_time3,
+  ncol = 3, nrow = 4,
+  widths  = c(0.9, 1.3, 1),
+  heights = c(0.5, 5, 5, 5),
+  top = textGrob("Fujita ZINB-WaVe PARAFAC model",
+                 gp = gpar(fontsize = 16, fontface = "bold")),
+  bottom = shared_legend
+)
+
+```
+
+```{r}
+
+fujita_plot <- arrangeGrob(
+  textGrob("Replicate mode", gp = gpar(fontsize = 14, fontface = "bold")),
+  textGrob("Taxa mode",      gp = gpar(fontsize = 14, fontface = "bold")),
+  textGrob("Time mode",      gp = gpar(fontsize = 14, fontface = "bold")),
+  p_samp1, p_taxa1, p_time1,
+  p_samp2, p_taxa2, p_time2,
+  p_samp3, p_taxa3, p_time3,
+  ncol = 3, nrow = 4,
+  widths  = c(0.9, 1.3, 1),
+  heights = c(0.5, 5, 5, 5),
+  top     = textGrob("Fujita ZINB-WaVe PARAFAC model",
+                     gp = gpar(fontsize = 16, fontface = "bold")),
+  bottom  = shared_legend
+)
+
+# save PNG
+ggsave("figs/Fujita_ZINB_PARAFAC.png",
+       plot   = fujita_plot,
+       device = ragg::agg_png,
+       width  = 13, height = 8, units = "in", dpi = 300)
+```

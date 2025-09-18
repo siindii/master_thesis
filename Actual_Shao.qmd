@@ -1,0 +1,1636 @@
+---
+title: "actual_finalShao"
+format: html
+editor: visual
+---
+
+## Shao2019
+
+```{r}
+library(rTensor)
+library(tidyverse)
+library(tidyr)
+library(parafac4microbiome)
+library(zinbwave)
+library(ggplot2)
+library(ggpubr)
+library(reshape2)
+library(SummarizedExperiment)
+library(dplyr)
+library(SingleCellExperiment)
+library(gridExtra)
+library(viridis)
+library(stringr)
+library(MASS)
+library(plotly)
+library(tibble)
+library(pheatmap)
+library(RColorBrewer)
+library(grid)
+library(broom)
+library(cowplot)
+library(gt)
+library(knitr)
+
+```
+
+Preprocessing and unfolding of cube into matrix, NAs are removed
+
+```{r}
+sparsity_processedShao = processDataCube(Shao2019, sparsityThreshold=0.9, considerGroups=TRUE, groupVariable="Delivery_mode", CLR=FALSE, centerMode= FALSE, scaleMode= FALSE)
+
+Shao_mode1 <- sparsity_processedShao$mode1
+Shao_mode2 <- sparsity_processedShao$mode2
+Shao_mode3 <- sparsity_processedShao$mode3
+
+Shao_tensor <- as.tensor(sparsity_processedShao$data)
+
+#unfolding along mode 1 (subject) and 3 (time) for rows, and mode 2 (OTU) for columns
+#matrix with each row = subject-time combination + each column = a taxon
+Shao_unfolded_tensor <- unfold(Shao_tensor, row_idx = c(1, 3), col_idx = 2)
+
+#from unfolded tensor to matrix
+Shao_matrix <- Shao_unfolded_tensor@data
+
+#row names combining Individual and time point
+Shao_row_names <- apply(expand.grid(Shao_mode1$Individual, Shao_mode3$Time_point), 1, paste, collapse = "_")
+rownames(Shao_matrix) <- Shao_row_names
+
+#ASVs from mode2 as column names
+colnames(Shao_matrix) <- Shao_mode2$OTU
+
+#remove rows that contain  NAs
+Shao_matrix_2d <- Shao_matrix[complete.cases(Shao_matrix), ]
+```
+
+Applying ZINB WaVe
+
+```{r}
+# Transposing the microbial abundance matrix to have samples as columns
+Shao_Y1 <- t(Shao_matrix_2d)
+
+
+# Fit ZINB model
+Shao_zinb_model_1 <- zinbFit(
+  Y = Shao_Y1, 
+  #X = design_matrix,
+  K = 0,
+  #epsilon = 1e12, 
+  maxiter.optimize = 25, 
+  verbose = TRUE,
+  commondispersion = TRUE,
+  zeroinflation = TRUE,
+  BPPARAM = BiocParallel::SerialParam()
+)
+
+
+print(Shao_zinb_model_1)
+```
+
+```{r}
+#getting model estimates for mu and pi
+Shao_mu_values1 <- getMu(Shao_zinb_model_1)
+Shao_pi_values1 <- getPi(Shao_zinb_model_1)
+
+#retransposing Y so it has the right orientation to calculate the residuals
+#Y_matrix_retransposed <- t(Y_matrix)
+
+Shao_residuals1 <- computeDevianceResiduals(Shao_zinb_model_1, Shao_matrix_2d)
+```
+
+## PARAFAC preprocessing
+
+```{r}
+#logical vector to track rows w NAs
+Shao_na_rows <- !complete.cases(Shao_matrix)
+
+#matrix with the same number of rows as the original unfolded tensor
+Shao_pi_values_full <- matrix(NA, nrow = nrow(Shao_matrix), ncol = ncol(Shao_pi_values1))
+
+#inserting values from the current matrix into the rows without NAs
+Shao_pi_values_full[!Shao_na_rows, ] <- Shao_pi_values1
+
+#restore row names
+#row_names <- apply(expand.grid(mode1$Individual, mode3$Time_point), 1, paste, collapse = "_")
+rownames(Shao_pi_values_full) <- Shao_row_names
+
+#and column names (OTUs)
+colnames(Shao_pi_values_full) <- Shao_mode2$OTU
+
+#Fold matrix back into tensor
+Shao_pi_tensor <- rTensor::fold(Shao_pi_values_full,
+                       row_idx = c(1, 3),   # Mode 1 (individuals) and mode 3 (time)
+                       col_idx = 2,         # Mode 2 (OTUs)
+                       modes = c(395, 90, 4))  # The original dimensions of the tensor
+
+
+print(dim(Shao_pi_tensor))
+
+```
+
+```{r}
+Shao_CLRprocessedCube <- processDataCube(sparsity_processedShao, CLR = TRUE, centerMode = FALSE, scaleMode = FALSE)
+
+Shao_pi_tensor <- as.tensor(Shao_pi_tensor@data)
+Shao_CLR_cube <- as.tensor(Shao_CLRprocessedCube$data)  # CLR processed cube
+
+#multiplying pi_tensor with CLRprocessedCube
+Shao_data_data <- (1 - Shao_pi_tensor) * Shao_CLR_cube
+```
+
+```{r}
+Shao_data_list <- list(
+    data = Shao_data_data, 
+    mode1 = Shao_mode1,
+    mode2 = Shao_mode2, 
+    mode3 = Shao_mode3  
+)
+
+
+#multiwaycenter + scale 
+Shao_center_data <- multiwayCenter(Shao_data_list$data, mode = 1)
+
+Shao_preprocessed_data <- multiwayScale(Shao_center_data, mode = 2)
+
+#print(Shao_preprocessed_data[,1,1])
+
+Shao_data_list <- list(
+    data = Shao_preprocessed_data, 
+    mode1 = Shao_mode1,
+    mode2 = Shao_mode2, 
+    mode3 = Shao_mode3  
+)
+```
+
+ZINB PARAFAC
+
+```{r}
+set.seed(111)
+
+# Setup
+minNumComponents = 1
+maxNumComponents = 6
+numRepetitions = 5 # number of randomly initialized models
+numFolds = 8 # number of jack-knifed models
+ctol = 1e-12
+maxit = 200
+numCores= 1
+
+colourCols = c("Delivery_mode", "phylum", "")
+legendTitles = c("Delivery mode", "Phylum", "")
+xLabels = c("Subject index", "Feature index", "Time index")
+legendColNums = c(3,5,0)
+arrangeModes = c(TRUE, TRUE, FALSE)
+continuousModes = c(FALSE,FALSE,TRUE)
+
+# Assess the metrics to determine the correct number of components
+Shao_qualityAssessment = assessModelQuality(Shao_preprocessed_data, minNumComponents, maxNumComponents, numRepetitions, ctol=ctol, maxit=maxit, numCores=numCores)
+```
+
+```{r}
+Shao_qualityAssessment$plots$overview
+```
+
+```{r}
+Shao_qualityAssessment$metrics$CORCONDIA
+```
+
+```{r}
+Shao_stabilityAssessment = assessModelStability(Shao_data_list, minNumComponents=1, maxNumComponents=4, numFolds=numFolds, considerGroups=TRUE,
+                                           groupVariable="Delivery_mode", colourCols, legendTitles, xLabels, legendColNums, arrangeModes,
+                                           ctol=ctol, maxit=maxit, numCores=numCores)
+
+Shao_stabilityAssessment$modelPlots[[1]]
+```
+
+```{r}
+Shao_stabilityAssessment$modelPlots[[2]]
+```
+
+```{r}
+Shao_stabilityAssessment$modelPlots[[3]]
+```
+
+```{r}
+numComponents = 2
+Shao_modelChoice = which(Shao_qualityAssessment$metrics$varExp[,numComponents] == max(Shao_qualityAssessment$metrics$varExp[,numComponents]))
+Shao_finalModel = Shao_qualityAssessment$models[[numComponents]][[Shao_modelChoice]]
+
+plotPARAFACmodel(Shao_finalModel$Fac, Shao_data_list, 2, colourCols, legendTitles, xLabels, legendColNums, arrangeModes,
+  continuousModes = c(FALSE,FALSE,TRUE),
+  overallTitle = "Shao PARAFAC model")
+
+Shao_finalModel$varExp
+```
+
+## parafac4microbiome Shao2019
+
+As done in <https://grvanderploeg.com/parafac4microbiome/articles/Shao2019_analysis.html>
+
+```{r}
+processedShao = processDataCube(Shao2019, sparsityThreshold=0.9, considerGroups=TRUE, groupVariable="Delivery_mode", CLR=TRUE, centerMode=1, scaleMode=2)
+```
+
+```{r}
+# Setup
+# For computational purposes we deviate from the default settings
+set.seed(111)
+
+# Setup
+minNumComponents = 1
+maxNumComponents = 6
+numRepetitions = 5 # number of randomly initialized models
+numFolds = 8 # number of jack-knifed models
+ctol = 1e-12
+maxit = 200
+numCores= 1
+
+colourCols = c("Delivery_mode", "phylum", "")
+legendTitles = c("Delivery mode", "Phylum", "")
+xLabels = c("Subject index", "Feature index", "Time index")
+legendColNums = c(3,5,0)
+arrangeModes = c(TRUE, TRUE, FALSE)
+continuousModes = c(FALSE,FALSE,TRUE)
+
+# Assess the metrics to determine the correct number of components
+qualityAssessment = assessModelQuality(processedShao$data, minNumComponents, maxNumComponents, numRepetitions, ctol=ctol, maxit=maxit, numCores=numCores)
+
+qualityAssessment$plots$overview
+```
+
+```{r}
+qualityAssessment$metrics$CORCONDIA
+```
+
+```{r}
+stabilityAssessment = assessModelStability(processedShao, minNumComponents=1, maxNumComponents=4, numFolds=numFolds, considerGroups=TRUE,
+                                           groupVariable="Delivery_mode", colourCols, legendTitles, xLabels, legendColNums, arrangeModes,
+                                           ctol=ctol, maxit=maxit, numCores=numCores)
+
+stabilityAssessment$modelPlots[[1]]
+```
+
+```{r}
+stabilityAssessment$modelPlots[[2]]
+```
+
+```{r}
+stabilityAssessment$modelPlots[[3]]
+```
+
+```{r}
+stabilityAssessment$modelPlots[[4]]
+```
+
+```{r}
+numComponents = 3
+modelChoice = which(qualityAssessment$metrics$varExp[,numComponents] == max(qualityAssessment$metrics$varExp[,numComponents]))
+p4m_Shao_finalModel = qualityAssessment$models[[numComponents]][[modelChoice]]
+```
+
+```{r}
+plotPARAFACmodel(p4m_Shao_finalModel$Fac, processedShao, 3, colourCols, legendTitles, xLabels, legendColNums, arrangeModes,
+  continuousModes = c(FALSE,FALSE,TRUE),
+  overallTitle = "Shao PARAFAC model")
+p4m_Shao_finalModel$varExp
+```
+
+```{r}
+# p4m_Shao_finalModel = flipLoadings(p4m_Shao_finalModel, processedShao$data)
+# 
+# plotPARAFACmodel(p4m_Shao_finalModel$Fac, processedShao, 3, colourCols, legendTitles, xLabels, legendColNums, arrangeModes,
+#   continuousModes = c(FALSE,FALSE,TRUE),
+#   overallTitle = "Shao PARAFAC model")
+```
+
+## Canonical Correlation Analysis
+
+```{r}
+#mode loadings selection
+subject_loadings_original_Shao <- p4m_Shao_finalModel$Fac[[1]]  
+subject_loadings_zinb_Shao <- Shao_finalModel$Fac[[1]]
+
+feat_loadings_original_Shao <- p4m_Shao_finalModel$Fac[[2]]  
+feat_loadings_zinb_Shao <- Shao_finalModel$Fac[[2]]
+
+time_loadings_original_Shao <- p4m_Shao_finalModel$Fac[[3]]  
+time_loadings_zinb_Shao <- Shao_finalModel$Fac[[3]]
+```
+
+```{r}
+#CCA for each mode
+cca_subjects <- cancor(subject_loadings_original_Shao, subject_loadings_zinb_Shao)
+cca_features <- cancor(feat_loadings_original_Shao, feat_loadings_zinb_Shao)
+cca_time <- cancor(time_loadings_original_Shao, time_loadings_zinb_Shao)
+
+# Plot settings
+par(mfrow = c(1, 1))  # Arrange plots in a row with custom margins
+
+# Subjects mode
+Shao_subject_variates_original <- subject_loadings_original_Shao %*% cca_subjects$xcoef
+Shao_subject_variates_zinb <- subject_loadings_zinb_Shao %*% cca_subjects$ycoef
+plot(Shao_subject_variates_original[, 1], Shao_subject_variates_zinb[, 1],
+     xlab = "p4m PARAFAC",
+     ylab = "ZINB-PARAFAC",
+     main = "Subjects Mode Shao2019",
+     pch = 16, col = "pink", cex = 1.2) 
+abline(a = 0, b = 1, col = "red", lwd = 2, lty = 2)  
+
+# Features mode
+Shao_feature_variates_original <- feat_loadings_original_Shao %*% cca_features$xcoef
+Shao_feature_variates_zinb <- feat_loadings_zinb_Shao %*% cca_features$ycoef
+plot(Shao_feature_variates_original[, 1], Shao_feature_variates_zinb[, 1],
+     xlab = "p4m PARAFAC",
+     ylab = "ZINB-PARAFAC",
+     main = "Features Mode",
+     pch = 16, col = "darkgreen", cex = 1.2) 
+abline(a = 0, b = 1, col = "red", lwd = 2, lty = 2) 
+
+
+# Time mode
+Shao_time_variates_original <- time_loadings_original_Shao %*% cca_time$xcoef
+Shao_time_variates_zinb <- time_loadings_zinb_Shao %*% cca_time$ycoef
+plot(Shao_time_variates_original[, 1], Shao_time_variates_zinb[, 1],
+     xlab = "p4m PARAFAC",
+     ylab = "ZINB-PARAFAC",
+     main = "Time Mode",
+     pch = 16, col = "skyblue", cex = 1.2)
+abline(a = 0, b = 1, col = "red", lwd = 2, lty = 2)  
+
+```
+
+```{r}
+#' Compute Factor Match Score for two models.
+
+
+FMS_random = function(Fac1, Fac2){
+
+  # Make robust towards 1-component case
+  Fac1 = lapply(Fac1, as.matrix)
+  Fac2 = lapply(Fac2, as.matrix)
+
+  # Setup
+  numComponents = ncol(Fac1[[1]])
+  numModes = length(Fac1)
+
+  stopifnot(length(Fac1) == length(Fac2))
+
+  FMSresult = matrix(1L, nrow=numComponents, ncol=numComponents)
+  for(i in 1:numModes){
+    similarityMatrix = matrix(0L, nrow=numComponents, ncol=numComponents)
+
+    for(j in 1:numComponents){
+      for(k in 1:numComponents){
+        vect1 = as.matrix(Fac1[[i]][,j])
+        vect2 = as.matrix(Fac2[[i]][,k])
+        similarityMatrix[j,k] = abs(t(vect1) %*% vect2) / (norm(vect1, "F") * norm(vect2, "F"))
+      }
+    }
+    FMSresult = FMSresult * similarityMatrix
+  }
+
+  # Find best combination
+  mapping = clue::solve_LSAP(FMSresult, maximum=TRUE)
+
+  # Find mapping matrix and calculate FMS
+  mappingMatrix = cbind(seq_along(mapping), mapping)
+
+  result = (sum(FMSresult[mappingMatrix])) / numComponents
+
+  return(result)
+}
+
+
+
+# Shao_Fac1 <- p4m_Shao_finalModel$Fac[1:3]
+# Shao_Fac2 <- Shao_finalModel$Fac[1:2]
+# 
+# Shao_fms_score <- FMS_random(Shao_Fac1, Shao_Fac2)
+# 
+# print(Shao_fms_score)
+
+```
+
+### Tucker Congruence Coefficient Heatmap
+
+```{r}
+calculateTCC = function(vect1, vect2){
+vect1 = as.matrix(vect1)
+vect2 = as.matrix(vect2)
+FMS = abs(t(vect1) %*% vect2) / (norm(vect1, "F") * norm(vect2, "F"))
+return(FMS)
+}
+```
+
+```{r}
+compute_tcc_matrix <- function(mat1, mat2) {
+  n1 <- ncol(mat1)
+  n2 <- ncol(mat2)
+  tcc_mat <- matrix(NA, nrow = n1, ncol = n2)
+  for (i in 1:n1) {
+    for (j in 1:n2) {
+      tcc_mat[i, j] <- calculateTCC(mat1[, i], mat2[, j])
+    }
+  }
+  rownames(tcc_mat) <- paste0("parafac4microbiome_", 1:n1)
+  colnames(tcc_mat) <- paste0("ZINB-WaVe_", 1:n2)
+  return(tcc_mat)
+}
+
+```
+
+```{r}
+# Subjects mode
+subject_tcc_matrix_Shao <- compute_tcc_matrix(subject_loadings_original_Shao, subject_loadings_zinb_Shao)
+pheatmap(subject_tcc_matrix_Shao,
+         cluster_rows = FALSE, cluster_cols = FALSE,
+         main = "TCC Heatmap - Subject Mode (Shao)", display_numbers = TRUE, 
+         color = colorRampPalette(c("white", "pink"))(50))
+
+# Features mode
+feature_tcc_matrix_Shao <- compute_tcc_matrix(feat_loadings_original_Shao, feat_loadings_zinb_Shao)
+pheatmap(feature_tcc_matrix_Shao,
+         cluster_rows = FALSE, cluster_cols = FALSE,
+         main = "TCC Heatmap - Feature Mode (Shao)", display_numbers = TRUE, 
+         color = colorRampPalette(c("white", "darkgreen"))(50))
+
+# Time mode
+time_tcc_matrix_Shao <- compute_tcc_matrix(time_loadings_original_Shao, time_loadings_zinb_Shao)
+pheatmap(time_tcc_matrix_Shao,
+         cluster_rows = FALSE, cluster_cols = FALSE,
+         main = "TCC Heatmap - Time Mode (Shao)", display_numbers = TRUE, 
+         color = colorRampPalette(c("white", "skyblue"))(50))
+```
+
+```{r}
+rownames(p4m_Shao_finalModel$Fac[[1]]) <- processedShao$mode1$Individual
+rownames(Shao_finalModel$Fac[[1]])     <- Shao_data_list$mode1$Individual
+
+```
+
+```{r}
+#extract components
+vec1_subject <- p4m_Shao_finalModel$Fac[[1]][, 2]
+vec2_subject <- Shao_finalModel$Fac[[1]][, 2]
+
+vec1_feature <- p4m_Shao_finalModel$Fac[[2]][, 2]
+vec2_feature <- Shao_finalModel$Fac[[2]][, 2]
+
+vec1_time <- p4m_Shao_finalModel$Fac[[3]][, 2]
+vec2_time <- Shao_finalModel$Fac[[3]][, 2]
+
+#TCC per mode
+tcc_subject <- calculateTCC(vec1_subject, vec2_subject)
+tcc_feature <- calculateTCC(vec1_feature, vec2_feature)
+tcc_time    <- calculateTCC(vec1_time, vec2_time)
+
+#combine
+local_fms <- tcc_subject * tcc_feature * tcc_time
+
+
+cat("TCC (subject):", round(tcc_subject, 3), "\n")
+cat("TCC (feature):", round(tcc_feature, 3), "\n")
+cat("TCC (time):   ", round(tcc_time, 3), "\n")
+cat("FMS (p4m_3 vs ZINB_2):", round(local_fms, 3), "\n")
+
+```
+
+```{r}
+#assumes `calculateTCC()` is already defined
+
+#helper: local FMS between component a_idx of model A and b_idx of model B
+local_fms_pair <- function(modelA, modelB, a_idx, b_idx) {
+  # modelA/modelB are the Fac lists: list(mode1, mode2, mode3)
+  v_subj_A <- modelA[[1]][, a_idx]; v_subj_B <- modelB[[1]][, b_idx]
+  v_feat_A <- modelA[[2]][, a_idx]; v_feat_B <- modelB[[2]][, b_idx]
+  v_time_A <- modelA[[3]][, a_idx]; v_time_B <- modelB[[3]][, b_idx]
+
+  tcc_subject <- calculateTCC(v_subj_A, v_subj_B)
+  tcc_feature <- calculateTCC(v_feat_A, v_feat_B)
+  tcc_time    <- calculateTCC(v_time_A, v_time_B)
+
+  list(
+    tcc_subject = tcc_subject,
+    tcc_feature = tcc_feature,
+    tcc_time    = tcc_time,
+    local_fms   = tcc_subject * tcc_feature * tcc_time
+  )
+}
+
+# Short aliases
+p4m  <- p4m_Shao_finalModel$Fac
+zinb <- Shao_finalModel$Fac
+
+# compare p4m Comp2 vs ZINB Comp2
+res_22 <- local_fms_pair(p4m, zinb, a_idx = 2, b_idx = 2)
+
+cat("---- p4m_2 vs ZINB_2 ----\n")
+cat("TCC (subject):", round(res_22$tcc_subject, 3), "\n")
+cat("TCC (feature):", round(res_22$tcc_feature, 3), "\n")
+cat("TCC (time):   ", round(res_22$tcc_time,    3), "\n")
+cat("Local FMS:    ", round(res_22$local_fms,   3), "\n\n")
+
+#compare p4m Comp3 vs ZINB Comp2
+res_32 <- local_fms_pair(p4m, zinb, a_idx = 3, b_idx = 2)
+
+cat("---- p4m_3 vs ZINB_2 ----\n")
+cat("TCC (subject):", round(res_32$tcc_subject, 3), "\n")
+cat("TCC (feature):", round(res_32$tcc_feature, 3), "\n")
+cat("TCC (time):   ", round(res_32$tcc_time,    3), "\n")
+cat("Local FMS:    ", round(res_32$local_fms,   3), "\n")
+
+```
+
+```{r}
+plot_tcc_panels <- function(subject_orig, subject_zinb,
+                            feature_orig, feature_zinb,
+                            time_orig, time_zinb,
+                            dataset = "Shao2019") {
+
+  #compute TCC matrices
+  subject_tcc <- compute_tcc_matrix(subject_orig, subject_zinb)
+  feature_tcc <- compute_tcc_matrix(feature_orig, feature_zinb)
+  time_tcc    <- compute_tcc_matrix(time_orig,    time_zinb)
+
+  #long format (x = p4m, y = ZINB)
+  to_long <- function(mat, mode_label, p4m_levels = rownames(mat), zinb_levels = colnames(mat)) {
+    as.data.frame(mat) %>%
+      rownames_to_column("p4m") %>%
+      pivot_longer(-p4m, names_to = "ZINB", values_to = "TCC") %>%
+      mutate(
+        Mode = mode_label,
+        p4m  = factor(p4m,  levels = p4m_levels),
+        ZINB = factor(ZINB, levels = rev(zinb_levels))  # show _1 at top
+      )
+  }
+
+  df_subj <- to_long(subject_tcc, "Subjects")
+  df_feat <- to_long(feature_tcc, "Features")
+  df_time <- to_long(time_tcc,    "Time")
+
+  #panel builder (per-mode gradient; keep colors)
+  make_panel <- function(df_mode, title, high_col) {
+    rng <- range(df_mode$TCC, na.rm = TRUE)
+    ggplot(df_mode, aes(x = p4m, y = ZINB, fill = TCC)) +
+      geom_tile(color = "white", linewidth = 0.8) +
+      geom_text(aes(label = sprintf("%.2f", TCC)),
+                size = 4, fontface = "bold", color = "grey10") +
+      scale_fill_gradient(low = "white", high = high_col, limits = rng, name = "TCC") +
+      scale_x_discrete(labels = function(l) sub(".*_(\\d+)$", "\\1", l)) +
+      scale_y_discrete(labels = function(l) sub(".*_(\\d+)$", "\\1", l)) +
+      coord_fixed() +
+      labs(title = title, x = "parafac4microbiome component", y = "ZINB-WaVe component") +
+      theme_minimal(base_size = 12) +
+      theme(
+        panel.grid = element_blank(),
+        plot.title = element_text(face = "bold", hjust = 0.5),
+        axis.text.x = element_text(angle = 0, vjust = 0.5),
+        legend.position = "none"
+      )
+  }
+
+  p_subj <- make_panel(df_subj, "Subjects", "#CC79A7")
+  p_feat <- make_panel(df_feat, "Features", "#009E73")
+  p_time <- make_panel(df_time, "Time",     "#56B4E9")
+
+  (p_subj | p_feat | p_time) +
+    plot_annotation(title = paste0("TCC heatmaps — ", dataset)) &
+    theme(plot.title = element_text(face = "bold", size = 14, hjust = 0.5))
+}
+
+
+plot_tcc_panels(
+  subject_loadings_original_Shao, subject_loadings_zinb_Shao,
+  feat_loadings_original_Shao,    feat_loadings_zinb_Shao,
+  time_loadings_original_Shao,    time_loadings_zinb_Shao,
+  dataset = "Shao2019"
+)
+```
+
+# Plots
+
+```{r}
+hist(Shao_residuals1, breaks = 40, main = "Histogram of Deviance Residuals in Shao2019", xlab = "Residuals", col = "skyblue")
+
+hist(Shao_pi_values1, breaks = 40, main = "Histogram of Zero Inflation Probabilities in Shao2019", xlab = "Probability of excess zero (π)", col = "orange")
+```
+
+```{r}
+Shao_observed_zeros <- rowSums(Shao_matrix_2d == 0)
+simulated_Shao <- zinbSim(Shao_zinb_model_1)
+Shao_simulated_counts1 <- as.data.frame(simulated_Shao$counts)
+Shao_simulated_counts1 <-t(Shao_simulated_counts1)
+Shao_simulated_zeros1 <- rowSums(Shao_simulated_counts1 == 0)
+#print(nrow(Y_matrix_retransposed))
+#print(nrow(simulated_counts))
+
+plot(Shao_observed_zeros, Shao_simulated_zeros1, main = "Observed vs Simulated Zeros in Shao2019", xlab = "Observed Zeros", ylab = "Simulated Zeros")
+abline(0, 1, col = "blue")
+
+# Fit a linear model
+zero_fit <- lm(Shao_simulated_zeros1 ~ Shao_observed_zeros)
+
+# Print the summary to get R-squared and p-value
+summary(zero_fit)
+```
+
+```{r}
+#extract values
+fit_summary <- summary(zero_fit)
+r_squared <- round(fit_summary$r.squared, 3)
+p_value <- signif(fit_summary$coefficients[2, 4], 3)
+
+#plot with annotation
+plot(Shao_observed_zeros, Shao_simulated_zeros1,
+     main = "Observed vs Simulated Zeros in Shao2019",
+     xlab = "Observed Zeros", ylab = "Simulated Zeros")
+abline(0, 1, col = "blue")  # reference line
+abline(zero_fit, col = "red", lty = 2)  # regression line
+legend("topleft",
+       legend = paste0("R² = ", r_squared, "\nP = ", p_value),
+       bty = "n")
+```
+
+```{r}
+plot_avg_simulated_zeros <- function(count_matrix, zinb_model, 
+                                     n_sims = 50, seed = 42, 
+                                     dataset_name = "Dataset") {
+  set.seed(seed)
+  
+  # Observed zeros per sample
+  observed_zeros <- rowSums(count_matrix == 0)
+  
+  # Run multiple simulations and collect zero counts
+  sim_zeros_mat <- replicate(
+    n_sims,
+    {
+      sim <- zinbSim(zinb_model)
+      sim_counts <- t(as.data.frame(sim$counts))  # transpose: rows = samples
+      rowSums(sim_counts == 0)
+    },
+    simplify = "matrix"
+  )
+  
+  # Average simulated zeros per sample
+  simulated_zeros_avg <- rowMeans(sim_zeros_mat)
+  
+  # Fit regression
+  zero_fit <- lm(simulated_zeros_avg ~ observed_zeros)
+  fit_summary <- summary(zero_fit)
+  
+  # Extract stats
+  r_squared <- round(fit_summary$r.squared, 3)
+  p_value   <- signif(fit_summary$coefficients[2, 4], 3)
+  
+  # Plot
+  plot(
+    observed_zeros, simulated_zeros_avg,
+    main = paste0("Observed vs Averaged Simulated Zeros (", n_sims, " sims) — ", dataset_name),
+    xlab = "Observed Zeros per Sample",
+    ylab = paste0("Simulated Zeros per Sample (average of ", n_sims, " sims)")
+  )
+  abline(0, 1, col = "blue")                 # 1:1 reference line
+  abline(zero_fit, col = "red", lty = 2)     # regression fit
+  legend(
+    "topleft",
+    legend = paste0("R² = ", r_squared, "\nP = ", p_value),
+    bty = "n"
+  )
+  
+  # Return stats invisibly
+  invisible(list(
+    fit = zero_fit,
+    summary = fit_summary,
+    R2 = r_squared,
+    pval = p_value
+  ))
+}
+
+```
+
+```{r}
+plot_avg_simulated_zeros(
+  Shao_matrix_2d, 
+  Shao_zinb_model_1, 
+  n_sims = 50, 
+  dataset_name = "Shao 2019"
+)
+```
+
+```{r}
+n_obs  <- nrow(Shao_matrix_2d)
+n_mod  <- nSamples(Shao_zinb_model_1)
+p_obs  <- ncol(Shao_matrix_2d)
+p_mod  <- nFeatures(Shao_zinb_model_1)
+
+cat("samples: matrix =", n_obs, " | model =", n_mod, "\n",
+    "features: matrix =", p_obs, " | model =", p_mod, "\n")
+
+```
+
+### Feature mode plot per component
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+library(dplyr)
+library(ggplot2)
+library(stringr)
+library(RColorBrewer)
+library(cowplot)
+
+n <- 10  # top & bottom taxa to show
+
+# ---------- helpers ----------
+get_top_bottom <- function(data, component_col, n) {
+  top    <- data %>% arrange(desc(!!rlang::sym(component_col))) %>% slice_head(n = n)
+  bottom <- data %>% arrange(!!rlang::sym(component_col))        %>% slice_head(n = n)
+  bind_rows(top, bottom) %>% arrange(!!rlang::sym(component_col))
+}
+
+make_labels <- function(motu_vec) {
+  base  <- stringr::str_split_fixed(motu_vec, " \\[", 2)[, 1]
+  parts <- stringr::str_split_fixed(base, " ", 3)
+  genus   <- parts[, 2]
+  species <- parts[, 3]
+  genus[is.na(genus)   | genus   == ""] <- "Unclassified"
+  species[is.na(species) | species == ""] <- ""
+  stringr::str_trim(paste(genus, species))
+}
+
+# ---------- palette ----------
+phylum_levels  <- c("Actinobacteria", "Bacteroidetes", "Firmicutes", "Proteobacteria", "Unclassified")
+cols <- RColorBrewer::brewer.pal(8, "Dark2")
+phylum_palette <- c(
+  "Actinobacteria" = cols[3],
+  "Bacteroidetes"  = cols[4],
+  "Firmicutes"     = cols[5],
+  "Proteobacteria" = cols[6],
+  "Unclassified"   = cols[7]
+)
+
+# ---------- data join + cleaning ----------
+taxa_all <- cbind(Shao_finalModel$Fac[[2]], Shao_data_list$mode2) %>%
+  tibble::as_tibble() %>%
+  mutate(
+    phylum = trimws(as.character(phylum)),
+    phylum = dplyr::na_if(phylum, ""),
+    # common synonyms -> canonical
+    phylum = dplyr::recode(
+      phylum,
+      "Bacteroidota"      = "Bacteroidetes",
+      "Actinobacteriota"  = "Actinobacteria",
+      "Firmicutes_A"      = "Firmicutes",
+      "Firmicutes_B"      = "Firmicutes",
+      .default = phylum
+    ),
+    phylum = tidyr::replace_na(phylum, "Unclassified"),
+    phylum = factor(phylum, levels = phylum_levels)
+  )
+
+
+# ===== COMPONENT 1 (left) ===
+
+df1 <- taxa_all %>% get_top_bottom("1", n) %>% mutate(index = dplyr::row_number())
+lab1 <- make_labels(df1$mOTU)
+
+component1_taxa_plot <- ggplot(df1, aes(x = `1`, y = factor(index), fill = phylum)) +
+  geom_col() +
+  xlab("Component 1") + ylab("") +
+  scale_y_discrete(labels = lab1) +
+  scale_fill_manual(values = phylum_palette, limits = phylum_levels, drop = FALSE) +
+  theme(text = element_text(size = 12), legend.position = "none")
+
+
+# ===== COMPONENT 2 (right) ==
+
+df2 <- taxa_all %>% get_top_bottom("2", n) %>% mutate(index = dplyr::row_number())
+lab2 <- make_labels(df2$mOTU)
+
+component2_taxa_plot <- ggplot(df2, aes(x = `2`, y = factor(index), fill = phylum)) +
+  geom_col() +
+  xlab("Component 2") + ylab("") +
+  scale_y_discrete(labels = lab2) +
+  scale_fill_manual(values = phylum_palette, limits = phylum_levels, drop = FALSE, name = "Phylum") +
+  theme(text = element_text(size = 12), legend.position = "none")
+
+# ---------- build a legend from a dummy df that contains ALL levels ----------
+legend_df <- data.frame(
+  phylum = factor(phylum_levels, levels = phylum_levels),
+  x = 1, y = 1
+)
+
+legend_plot <- ggplot(legend_df, aes(x, y, fill = phylum)) +
+  geom_col() +
+  scale_fill_manual(values = phylum_palette, limits = phylum_levels, name = "Phylum") +
+  theme_void(base_size = 12) +
+  theme(
+    legend.position = "bottom",
+    legend.box = "horizontal",
+    legend.background = element_blank(),
+    legend.key = element_rect(fill = "transparent"),
+    legend.margin = margin(t = 4, r = 0, b = 4, l = 0)
+  ) +
+  guides(fill = guide_legend(nrow = 1, byrow = TRUE))
+
+legend_g <- cowplot::get_legend(legend_plot)
+
+# ---------- stack right panel over legend; then combine with left ----------
+right_col <- cowplot::plot_grid(component2_taxa_plot, legend_g, ncol = 1, rel_heights = c(1, 0.10), align = "v")
+final_plot <- cowplot::plot_grid(component1_taxa_plot, right_col, ncol = 2, rel_widths = c(1, 1), align = "h")
+
+print(final_plot)
+
+```
+
+### Birth mode plot
+
+```{r}
+combined_data1 <- cbind(Shao_data_list$mode1, Shao_finalModel$Fac[[1]]) %>% as_tibble()
+combined_data <- combined_data1 %>% mutate(Delivery_mode = as.factor(Delivery_mode))
+
+#plot
+combined_data1 %>%
+  pivot_longer(-c(Delivery_mode, Individual)) %>%
+  #specifying component 2 
+  filter(name == 2) %>% 
+  #plotting
+  ggplot(aes(x = Delivery_mode, y = value, fill = Delivery_mode)) +
+  geom_boxplot(outlier.shape = NA, width = 0.7, alpha = 0.7) +
+  geom_jitter(width = 0.15, alpha = 0.5) +  
+  stat_compare_means(
+    method = "wilcox.test",  
+    label = "p.format"       
+  ) +
+  labs(
+    title = "Comparison of PARAFAC Model Component 2 by Delivery Mode",
+    subtitle = "Statistical test: Wilcoxon rank-sum test",
+    x = "Delivery Mode",
+    y = "PARAFAC Component Value",
+    fill = "Delivery Mode"
+  ) +
+  scale_x_discrete(labels = c("0" = "Caesarean", "1" = "Vaginal")) +
+  scale_fill_manual(values = c("Caesarean" = "red", "Vaginal" = "#56BCC2")) + 
+  theme_minimal() +
+  theme(
+    plot.title = element_text(size = 14, face = "bold"),
+    plot.subtitle = element_text(size = 10, face = "italic"),
+    axis.title = element_text(size = 12),
+    axis.text = element_text(size = 10),
+    legend.position = "none" 
+  )
+
+```
+
+### Zero Cube Plot
+
+```{r}
+# n_subj   <- 394
+# n_feat   <- 90
+# n_time   <- 4
+# 
+# 
+# coords_Shao <- expand.grid(
+#   subject = seq_len(n_subj),
+#   feature = seq_len(n_feat),
+#   time    = seq_len(n_time)
+# )
+# 
+# 
+# coords_Shao$counts <- as.vector(Shao_tensor@data)
+# coords_Shao$pi <- as.vector(Shao_pi_tensor@data)
+# 
+# 
+# zeros_Shao <- subset(coords_Shao, counts == 0)
+# 
+# 
+# plot_ly(
+#   data = zeros_Shao,
+#   x = ~subject,
+#   y = ~feature,
+#   z = ~time,
+#   color = ~pi,  # continuous color scale by pi
+#   type = "scatter3d",
+#   mode = "markers",
+#   marker = list(size = 3)
+# ) %>%  
+# plotly::layout(
+#   scene = list(
+#     xaxis = list(title = "Subject"),
+#     yaxis = list(title = "Feature"),
+#     zaxis = list(title = "Time")
+#   ),
+#   title = "Zero Counts Colored by ZINB pi - Shao2019"
+# )
+
+```
+
+### Final grid plot
+
+```{r}
+# Convert time loadings to tibble
+# Create time loadings df with column names
+time_loadings_df <- as_tibble(time_loadings_zinb_Shao) %>%
+  setNames(c("Comp1", "Comp2")) %>%
+  mutate(Timestep = 1:n())
+
+# Component 1 time plot
+component1_time_plot <- ggplot(time_loadings_df, aes(x = Timestep, y = Comp1)) +
+  geom_line(color = "#377EB8", size = 1.2) +
+  geom_point(color = "#377EB8", size = 2) +
+  labs(title = "Temporal Profile - Component 1", x = "Time Point", y = "Loading") +
+  theme_minimal(base_size = 12)
+
+# Component 2 time plot
+component2_time_plot <- ggplot(time_loadings_df, aes(x = Timestep, y = Comp2)) +
+  geom_line(color = "#377EB8", size = 1.2) +
+  geom_point(color = "#377EB8", size = 2) +
+  labs(title = "Temporal Profile - Component 2", x = "Time Point", y = "Loading") +
+  theme_minimal(base_size = 12)
+
+
+```
+
+```{r}
+
+# First column: Subject loadings (top: Comp 1, bottom: Comp 2)
+subject_comp1_plot <- combined_data1 %>%
+  pivot_longer(-c(Delivery_mode, Individual)) %>%
+  filter(name == 1) %>%
+  ggplot(aes(x = Delivery_mode, y = value, fill = Delivery_mode)) +
+  geom_boxplot(outlier.shape = NA, width = 0.7, alpha = 0.7) +
+  geom_jitter(width = 0.15, alpha = 0.5) +  
+  stat_compare_means(method = "wilcox.test", label = "p.format") +
+  labs(
+    title = "Component 1 vs Delivery Mode",
+    subtitle = "Wilcoxon test",
+    x = "Delivery Mode",
+    y = "PARAFAC Component 1"
+  ) +
+  scale_x_discrete(labels = c("0" = "Caesarean", "1" = "Vaginal")) +
+  scale_fill_manual(values = c("Caesarean" = "red", "Vaginal" = "#56BCC2")) + 
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "none")
+
+subject_comp2_plot <- combined_data1 %>%
+  pivot_longer(-c(Delivery_mode, Individual)) %>%
+  filter(name == 2) %>%
+  ggplot(aes(x = Delivery_mode, y = value, fill = Delivery_mode)) +
+  geom_boxplot(outlier.shape = NA, width = 0.7, alpha = 0.7) +
+  geom_jitter(width = 0.15, alpha = 0.5) +  
+  stat_compare_means(method = "wilcox.test", label = "p.format") +
+  labs(
+    title = "Component 2 vs Delivery Mode",
+    subtitle = "Wilcoxon test",
+    x = "Delivery Mode",
+    y = "PARAFAC Component 2"
+  ) +
+  scale_x_discrete(labels = c("0" = "Caesarean", "1" = "Vaginal")) +
+  scale_fill_manual(values = c("Caesarean" = "red", "Vaginal" = "#56BCC2")) + 
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "none")
+
+# Arrange: 2 rows (Comp1, Comp2) × 3 columns (Subjects, Features, Time)
+grid.arrange(textGrob("Subject Loadings", gp = gpar(fontsize = 14, fontface = "bold")), textGrob("Taxa Loadings", gp = gpar(fontsize = 14, fontface = "bold")), textGrob("Time Loadings", gp = gpar(fontsize = 14, fontface = "bold")),
+  subject_comp1_plot, component1_taxa_plot, component1_time_plot,
+  subject_comp2_plot, component2_taxa_plot, component2_time_plot,
+  ncol = 3,
+  heights = c(0.5, 5, 5)
+)
+
+```
+
+```{r}
+
+# ---------- params ----------
+n <- 15  # top & bottom taxa per component to show
+
+# ---------- helpers ----------
+get_top_bottom <- function(data, component_col, n) {
+  top    <- data %>% arrange(desc(!!rlang::sym(component_col))) %>% slice_head(n = n)
+  bottom <- data %>% arrange(!!rlang::sym(component_col))        %>% slice_head(n = n)
+  bind_rows(top, bottom) %>% arrange(!!rlang::sym(component_col))
+}
+
+make_labels <- function(motu_vec) {
+  base  <- stringr::str_split_fixed(motu_vec, " \\[", 2)[, 1]
+  parts <- stringr::str_split_fixed(base, " ", 3)
+  genus   <- parts[, 2]
+  species <- parts[, 3]
+  genus[is.na(genus)   | genus   == ""] <- "Unclassified"
+  species[is.na(species) | species == ""] <- ""
+  stringr::str_trim(paste(genus, species))
+}
+
+# ---------- Phylum palette (fixed levels + named colors) ----------
+phylum_levels  <- c("Actinobacteria", "Bacteroidetes", "Firmicutes", "Proteobacteria", "Unclassified")
+cols <- RColorBrewer::brewer.pal(8, "Dark2")
+phylum_palette <- c(
+  "Actinobacteria" = cols[3],
+  "Bacteroidetes"  = cols[4],
+  "Firmicutes"     = cols[5],
+  "Proteobacteria" = cols[6],
+  "Unclassified"   = cols[7]
+)
+
+# ---------- data join + cleaning for TAXA (mode 2) ----------
+# Assumes Shao_finalModel$Fac[[2]] has 2 components (columns "1" and "2")
+taxa_all <- cbind(Shao_finalModel$Fac[[2]], Shao_data_list$mode2) %>%
+  tibble::as_tibble() %>%
+  mutate(
+    phylum = trimws(as.character(phylum)),
+    phylum = dplyr::na_if(phylum, ""),
+    # harmonize common synonyms to canonical names
+    phylum = dplyr::recode(
+      phylum,
+      "Bacteroidota"     = "Bacteroidetes",
+      "Actinobacteriota" = "Actinobacteria",
+      "Firmicutes_A"     = "Firmicutes",
+      "Firmicutes_B"     = "Firmicutes",
+      .default = phylum
+    ),
+    phylum = tidyr::replace_na(phylum, "Unclassified"),
+    phylum = factor(phylum, levels = phylum_levels)
+  )
+
+
+# ===== TAXA: COMPONENT 1 ====
+
+df1  <- taxa_all %>% get_top_bottom("1", n) %>% mutate(index = dplyr::row_number())
+lab1 <- make_labels(df1$mOTU)
+
+component1_taxa_plot <- ggplot(df1, aes(x = `1`, y = factor(index), fill = phylum)) +
+  geom_col() +
+  xlab("Component 1") + ylab(NULL) +
+  scale_y_discrete(labels = lab1) +
+  scale_fill_manual(values = phylum_palette, limits = phylum_levels, drop = FALSE, name = "Phylum") +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "none")
+
+# ===== TAXA: COMPONENT 2 ====
+
+df2  <- taxa_all %>% get_top_bottom("2", n) %>% mutate(index = dplyr::row_number())
+lab2 <- make_labels(df2$mOTU)
+
+component2_taxa_plot <- ggplot(df2, aes(x = `2`, y = factor(index), fill = phylum)) +
+  geom_col() +
+  xlab("Component 2") + ylab(NULL) +
+  scale_y_discrete(labels = lab2) +
+  scale_fill_manual(values = phylum_palette, limits = phylum_levels, drop = FALSE, name = "Phylum") +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "none")
+
+# ---------- ONE shared Phylum legend (bottom) ----------
+legend_df <- tibble(phylum = factor(phylum_levels, levels = phylum_levels), x = 1, y = 1)
+
+legend_plot <- ggplot(legend_df, aes(x, y, fill = phylum)) +
+  geom_col() +
+  scale_fill_manual(values = phylum_palette, limits = phylum_levels, name = "Phylum") +
+  theme_void(base_size = 12) +
+  theme(
+    legend.position = "bottom",
+    legend.box = "horizontal",
+    legend.background = element_blank(),
+    legend.key = element_rect(fill = "transparent"),
+    legend.margin = margin(t = 4, r = 0, b = 4, l = 0)
+  ) +
+  guides(fill = guide_legend(nrow = 1, byrow = TRUE))
+
+shared_phylum_legend <- cowplot::get_legend(legend_plot)
+
+
+# ===== SUBJECT (mode 1) =====
+
+combined_data1 <- cbind(Shao_data_list$mode1, Shao_finalModel$Fac[[1]]) %>% as_tibble()
+combined_data  <- combined_data1 %>% mutate(Delivery_mode = as.factor(Delivery_mode))
+
+subject_comp1_plot <- combined_data1 %>%
+  pivot_longer(-c(Delivery_mode, Individual)) %>%
+  filter(name == 1) %>%
+  ggplot(aes(x = Delivery_mode, y = value, fill = Delivery_mode)) +
+  geom_boxplot(outlier.shape = NA, width = 0.7, alpha = 0.7) +
+  geom_jitter(width = 0.15, alpha = 0.5) +
+  ggpubr::stat_compare_means(method = "wilcox.test", label = "p.format") +
+  labs(title = "Component 1 vs Delivery Mode", subtitle = "Wilcoxon test",
+       x = "Delivery Mode", y = "PARAFAC Component 1") +
+  scale_x_discrete(labels = c("0" = "Caesarean", "1" = "Vaginal")) +
+  scale_fill_manual(values = c("Caesarean" = "red", "Vaginal" = "#56BCC2")) +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "none")
+
+subject_comp2_plot <- combined_data1 %>%
+  pivot_longer(-c(Delivery_mode, Individual)) %>%
+  filter(name == 2) %>%
+  ggplot(aes(x = Delivery_mode, y = value, fill = Delivery_mode)) +
+  geom_boxplot(outlier.shape = NA, width = 0.7, alpha = 0.7) +
+  geom_jitter(width = 0.15, alpha = 0.5) +
+  ggpubr::stat_compare_means(method = "wilcox.test", label = "p.format") +
+  labs(title = "Component 2 vs Delivery Mode", subtitle = "Wilcoxon test",
+       x = "Delivery Mode", y = "PARAFAC Component 2") +
+  scale_x_discrete(labels = c("0" = "Caesarean", "1" = "Vaginal")) +
+  scale_fill_manual(values = c("Caesarean" = "red", "Vaginal" = "#56BCC2")) +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "none")
+
+
+# ===== TIME (mode 3) ========
+
+time_loadings_df <- as_tibble(time_loadings_zinb_Shao) %>%
+  setNames(c("Comp1", "Comp2")) %>%
+  mutate(Timestep = 1:n())
+
+component1_time_plot <- ggplot(time_loadings_df, aes(x = Timestep, y = Comp1)) +
+  geom_line(color = "#377EB8", size = 1.2) +
+  geom_point(color = "#377EB8", size = 2) +
+  labs(title = "Temporal Profile - Component 1", x = "Time Point", y = "Loading") +
+  theme_minimal(base_size = 12)
+
+component2_time_plot <- ggplot(time_loadings_df, aes(x = Timestep, y = Comp2)) +
+  geom_line(color = "#377EB8", size = 1.2) +
+  geom_point(color = "#377EB8", size = 2) +
+  labs(title = "Temporal Profile - Component 2", x = "Time Point", y = "Loading") +
+  theme_minimal(base_size = 12)
+
+
+#Final Grid + Title + Legend
+
+panel_grid <- gridExtra::arrangeGrob(
+  textGrob("Subject Loadings", gp = gpar(fontsize = 14, fontface = "bold")),
+  textGrob("Taxa Loadings",    gp = gpar(fontsize = 14, fontface = "bold")),
+  textGrob("Time Loadings",    gp = gpar(fontsize = 14, fontface = "bold")),
+  subject_comp1_plot, component1_taxa_plot, component1_time_plot,
+  subject_comp2_plot, component2_taxa_plot, component2_time_plot,
+  ncol = 3,
+  heights = c(0.6, 5, 5)
+)
+
+# Wrap with title and legend
+final_plot <- gridExtra::arrangeGrob(
+  panel_grid,
+  top = textGrob("Shao2019 ZINB-WaVe PARAFAC model", gp = gpar(fontsize = 16, fontface = "bold")),
+  bottom = shared_phylum_legend
+)
+
+# Draw it
+grid.newpage()
+grid.draw(final_plot)
+
+ggsave("figs/Shao2019_ZINB_PARAFAC.png", plot = final_plot,
+        device = ragg::agg_png, width = 13, height = 8, units = "in", dpi = 300)
+```
+
+## Metadata addition
+
+```{r}
+ShaoMetadata <- read.csv("/Users/sindi/Desktop/intern_work/Shao_sampleMetadatacopy.csv", skip = 2) %>%
+  as_tibble()
+
+```
+
+```{r}
+Fac <- Shao_finalModel$Fac
+```
+
+```{r}
+subjectLoadings <- cbind(Fac[[1]], Shao_mode1) %>% 
+  as_tibble() %>%
+  left_join(ShaoMetadata, by = "Individual")
+
+```
+
+```{r}
+colnames(subjectLoadings)[1:ncol(Fac[[1]])] <- paste0("Component_", 1:ncol(Fac[[1]]))
+
+```
+
+Preprocessing
+
+```{r}
+#clean categorical variables
+subjectLoadings <- subjectLoadings %>%
+  mutate(
+    Abx_Baby_in_hospital = case_when(
+      Abx_Baby_in_hospital %in% c("yes", "Yes", "YES") ~ "Yes",
+      Abx_Baby_in_hospital %in% c("no", "No", "NO") ~ "No",
+      TRUE ~ NA_character_
+    ),
+    Abx_Baby_after_hospital = case_when(
+      Abx_Baby_after_hospital %in% c("yes", "Yes", "YES") ~ "Yes",
+      Abx_Baby_after_hospital %in% c("no", "No", "NO") ~ "No",
+      TRUE ~ NA_character_
+    ),
+    Abx_mother_labour_IAP = case_when(
+      Abx_mother_labour_IAP %in% c("yes", "Yes", "YES") ~ "Yes",
+      Abx_mother_labour_IAP %in% c("no", "No", "NO") ~ "No",
+      TRUE ~ NA_character_
+    ),
+    Gender = case_when(
+      Gender %in% c("male", "Male", "MALE") ~ "Male",
+      Gender %in% c("female", "Female", "FEMALE") ~ "Female",
+      TRUE ~ NA_character_
+    ),
+    Feeding_method = case_when(
+      Feeding_method %in% c("BF", "bf","Mixed", "mixed") ~ "BF",
+      Feeding_method %in% c("NoBF", "nobf") ~ "NoBF",
+      #Feeding_method %in% c("Mixed", "mixed") ~ "Mixed",
+      TRUE ~ NA_character_
+    ),
+    Delivery_mode.x = case_when(
+      Delivery_mode.x %in% c("Caesarean", "caesarean") ~ "Caesarean",
+      Delivery_mode.x %in% c("Vaginal", "vaginal") ~ "Vaginal",
+      TRUE ~ NA_character_
+    ),
+    Bacteroides_profile = case_when(
+      Bacteroides_profile == "low_Bacteroides" ~ "low_Bacteroides",
+      Bacteroides_profile == "normal_Bacteroides" ~ "normal_Bacteroides",
+      TRUE ~ NA_character_
+    )
+  )
+
+```
+
+\
+Testing
+
+```{r}
+#metadata variables to test
+variables_to_test <- c(
+  "Delivery_mode.x", 
+  "Feeding_method", 
+  "Gender", 
+  "Abx_mother_labour_IAP", 
+  "Abx_Baby_in_hospital", 
+  "Abx_Baby_after_hospital", 
+  "Bacteroides_profile"
+)
+
+#defining binary comparison groups
+group_levels <- list(
+  Delivery_mode.x = c("Caesarean", "Vaginal"),
+  Feeding_method = c("BF", "NoBF"),
+  Gender = c("Male", "Female"),
+  Abx_mother_labour_IAP = c("Yes", "No"),
+  Abx_Baby_in_hospital = c("Yes", "No"),
+  Abx_Baby_after_hospital = c("Yes", "No"),
+  Bacteroides_profile = c("low_Bacteroides", "normal_Bacteroides")
+)
+
+#inferring number of components from the data (easier to use on all datasets)
+n_components <- sum(startsWith(colnames(subjectLoadings), "Component_"))
+
+#matrix for uncorrected p-values
+uncorrectedP <- matrix(NA, nrow = n_components, ncol = length(variables_to_test))
+rownames(uncorrectedP) <- paste0("Component_", 1:n_components)
+colnames(uncorrectedP) <- variables_to_test
+
+#Wilcoxon tests
+for (j in seq_along(variables_to_test)) {
+  var <- variables_to_test[j]
+  g1 <- group_levels[[var]][1]
+  g2 <- group_levels[[var]][2]
+  
+  for (k in 1:n_components) {
+    comp <- paste0("Component_", k)
+    
+    # Exclude NA values
+    subset_data <- subjectLoadings %>% filter(!is.na(.data[[var]]))
+    
+    g1_vals <- subset_data %>% filter(.data[[var]] == g1) %>% pull(comp)
+    g2_vals <- subset_data %>% filter(.data[[var]] == g2) %>% pull(comp)
+    
+    if (length(g1_vals) > 0 && length(g2_vals) > 0) {
+      uncorrectedP[k, j] <- wilcox.test(g1_vals, g2_vals)$p.value
+    }
+  }
+}
+
+#Benjamini-Hochberg correction
+correctedP <- matrix(p.adjust(uncorrectedP, method = "BH"), nrow = n_components)
+colnames(correctedP) <- colnames(uncorrectedP)
+rownames(correctedP) <- rownames(uncorrectedP)
+
+
+#uncorrectedP
+correctedP
+
+
+```
+
+```{r}
+signif_results <- as_tibble(correctedP, rownames = "Component") %>%
+  pivot_longer(-Component, names_to = "Variable", values_to = "Adjusted_p") %>%
+  filter(Adjusted_p < 0.05) %>%
+  arrange(Adjusted_p)
+
+print(signif_results)
+```
+
+```{r}
+
+for (i in seq_len(nrow(signif_results))) {
+  comp <- signif_results$Component[i]
+  var <- signif_results$Variable[i]
+
+  subset_data <- subjectLoadings %>%
+  filter(!is.na(.data[[var]]))
+
+p <- ggplot(subset_data, aes(x = .data[[var]], y = .data[[comp]], fill = .data[[var]])) +
+  geom_boxplot(outlier.shape = NA, alpha = 0.6, width = 0.6) +
+  geom_jitter(width = 0.1, alpha = 0.2, color = "black") +
+  labs(
+    title = paste("Effect of", var, "on", comp),
+    subtitle = paste("Adjusted p =", signif_results$Adjusted_p[i]),
+    x = var,
+    y = paste("Loading on", comp),
+    fill = var
+  ) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 30, hjust = 1))
+
+print(p)
+
+}
+
+```
+
+```{r}
+
+# tidy
+wilcox_results <- as_tibble(correctedP, rownames = "Component") %>%
+  pivot_longer(-Component, names_to = "Variable", values_to = "Adjusted_p")
+
+# helper to clean variable names
+clean_var <- function(x) {
+  case_when(
+    x == "Delivery_mode.x"         ~ "Delivery mode",
+    x == "Feeding_method"          ~ "Feeding method",
+    x == "Gender"                  ~ "Gender",
+    x == "Abx_mother_labour_IAP"   ~ "Antibiotics mother during labor (IAP)",
+    x == "Abx_Baby_in_hospital"    ~ "Antibiotics baby in hospital",
+    x == "Abx_Baby_after_hospital" ~ "Antibiotics baby after hospital",
+    x == "Bacteroides_profile"     ~ "Bacteroides profile",
+    TRUE ~ str_to_sentence(gsub("_", " ", gsub("\\.x$", "", x)))
+  )
+}
+
+wilcox_signif <- wilcox_results %>%
+  filter(Adjusted_p < 0.05) %>%
+  arrange(Component, Adjusted_p) %>%
+  mutate(
+    Component = gsub("_", " ", Component),     # "Component_1" -> "Component 1"
+    Variable  = clean_var(Variable)
+  )
+
+# format + table
+wilcox_signif %>%
+  mutate(Adjusted_p = formatC(Adjusted_p, format = "e", digits = 2)) %>%
+  gt(rowname_col = "Component") %>%
+  tab_header(
+    title = md("**Significant Associations from Wilcoxon Tests**"),
+    subtitle = "(Benjamini–Hochberg corrected)"
+  ) %>%
+  cols_label(
+    Variable   = "Metadata Variable",
+    Adjusted_p = "Adjusted p-value"
+  ) %>%
+  tab_style(
+    style = cell_text(weight = "bold"),
+    locations = cells_body(columns = "Adjusted_p")
+  ) %>%
+  tab_options(
+    table.border.top.color = "black",
+    table.border.bottom.color = "black",
+    column_labels.border.bottom.color = "black",
+    heading.border.bottom.color = "black",
+    table.font.size = "small"
+  )
+
+```
+
+### Multiple Linear Regression
+
+```{r}
+#define factors
+subjectLoadings <- subjectLoadings %>%
+  mutate(across(
+    c(Delivery_mode.x, Feeding_method, Gender, Abx_mother_labour_IAP,
+      Abx_Baby_in_hospital, Abx_Baby_after_hospital, Bacteroides_profile),
+    ~ factor(.x)
+  ))
+
+#variables to include in regression
+regression_formula <- as.formula(
+  paste("Component_k ~", paste(
+    c("Delivery_mode.x", "Feeding_method", "Gender",
+      "Abx_mother_labour_IAP", "Abx_Baby_in_hospital",
+      "Abx_Baby_after_hospital", "Bacteroides_profile"),
+    collapse = " + ")
+  )
+)
+
+#multiple linear regression for each component
+results <- map_dfr(1:n_components, function(k) {
+  comp_col <- paste0("Component_", k)
+  
+  df <- subjectLoadings %>%
+    select(all_of(c(comp_col, all.vars(regression_formula)[-1]))) %>%
+    rename(Component_k = !!comp_col) %>%
+    drop_na() %>%
+    mutate(across(where(is.factor), ~ droplevels(.)))  # drop unused levels
+  
+  # fit model
+  fit <- lm(regression_formula, data = df)
+  
+  #extract stats
+  tidy_fit <- broom::tidy(fit, conf.int = TRUE)
+  
+  tidy_fit %>%
+    filter(term != "(Intercept)") %>%
+    mutate(
+      Component = k,
+      Estimate_scaled = estimate,  
+      P_adj = p.adjust(p.value, method = "BH")
+    ) %>%
+    select(Component, term, Estimate_scaled, conf.low, conf.high, p.value, P_adj)
+})
+
+
+results %>%
+  arrange(P_adj)
+
+
+```
+
+```{r}
+
+pretty_labels <- c(
+  "Delivery_mode.x"         = "Delivery mode",
+  "Feeding_method"          = "Feeding method",
+  "Gender"                  = "Gender",
+  "Abx_mother_labour_IAP"   = "Antibiotics mother during labor (IAP)",
+  "Abx_Baby_in_hospital"    = "Antibiotics baby in hospital",
+  "Abx_Baby_after_hospital" = "Antibiotics baby after hospital",
+  "Bacteroides_profile"     = "Bacteroides profile"
+)
+
+prettify_term <- function(x){
+  v <- names(pretty_labels)[startsWith(x, names(pretty_labels))]
+  if(length(v) == 0) return(gsub("_", " ", x))
+  v <- v[which.max(nchar(v))]
+  lvl <- substr(x, nchar(v) + 1, nchar(x))
+  lvl <- gsub("^\\.*", "", lvl)
+  lvl <- gsub("_", " ", lvl)
+  paste0(pretty_labels[[v]], ifelse(nchar(lvl) > 0, paste0(": ", lvl), ""))
+}
+
+alpha <- 0.05  # threshold for bolding p-values
+
+nice_tbl <- results %>%
+  filter(if_all(c(Estimate_scaled, conf.low, conf.high, p.value, P_adj), ~ !is.na(.))) %>%
+  mutate(Term = vapply(term, prettify_term, character(1))) %>%
+  arrange(Component, P_adj) %>%
+  mutate(
+    Estimate = sprintf("%.3f", Estimate_scaled),
+    CI       = sprintf("[%.3f, %.3f]", conf.low, conf.high),
+    p_fmt    = formatC(p.value, format = "fg", digits = 3),
+    p_fmt    = ifelse(p.value < alpha, paste0("**", p_fmt, "**"), p_fmt),
+    q_fmt    = formatC(P_adj, format = "fg", digits = 3)
+  ) %>%
+  transmute(
+    Component, Term, Estimate, `95% CI` = CI,
+    `p-value` = p_fmt, `q (BH)` = q_fmt
+  )
+
+knitr::kable(nice_tbl, align = "clccc", escape = FALSE,
+             caption = "Component associations with metadata")
+
+```
+
+```{r}
+
+alpha <- 0.05
+
+# ---------- Pretty labels for variables ----------
+pretty_labels <- c(
+  "Delivery_mode.x"         = "Delivery mode",
+  "Feeding_method"          = "Feeding method",
+  "Gender"                  = "Gender",
+  "Abx_mother_labour_IAP"   = "Antibiotics mother during labor (IAP)",
+  "Abx_Baby_in_hospital"    = "Antibiotics baby in hospital",
+  "Abx_Baby_after_hospital" = "Antibiotics baby after hospital",
+  "Bacteroides_profile"     = "Bacteroides profile"
+)
+
+clean_var <- function(x) {
+  raw <- gsub("\\.x$", "", x)
+  ifelse(raw %in% names(pretty_labels),
+         unname(pretty_labels[raw]),
+         str_to_sentence(gsub("_", " ", raw)))
+}
+
+# Level cleaner for MLR terms
+clean_level <- function(var_raw, level_raw){
+  lvl <- gsub("^\\.*", "", level_raw)         # drop leading dots
+  lvl <- gsub("_", " ", lvl)
+  dplyr::case_when(
+    var_raw == "Feeding_method" & lvl == "NoBF" ~ "No breastfeeding",
+    TRUE ~ lvl
+  )
+}
+
+# Helpers to split MLR term -> var + level
+get_var_raw <- function(term){
+  hits <- names(pretty_labels)[startsWith(term, names(pretty_labels))]
+  if(length(hits) == 0) return(term)
+  hits[which.max(nchar(hits))]
+}
+get_level_raw <- function(term){
+  v <- get_var_raw(term)
+  sub(paste0("^", v), "", term)
+}
+
+# ----------  MLR results (per level) ----------
+mlr_clean <- results %>%
+  filter(if_all(c(Estimate_scaled, conf.low, conf.high, p.value, P_adj), ~ !is.na(.))) %>%
+  mutate(
+    var_raw   = vapply(term, get_var_raw, character(1)),
+    level_raw = vapply(term, get_level_raw, character(1)),
+    Variable  = clean_var(var_raw),
+    Level     = clean_level(var_raw, level_raw),
+    Component = as.integer(Component)
+  ) %>%
+  transmute(
+    Component,
+    Variable,
+    Level,
+    Estimate = Estimate_scaled,
+    CI       = sprintf("[%.3f, %.3f]", conf.low, conf.high),
+    MLR_p    = p.value,
+    MLR_q    = P_adj
+  )
+
+# ---------- Wilcoxon results (BH-adjusted q) ----------
+wilcox_tidy <- as_tibble(correctedP, rownames = "Component") %>%
+  pivot_longer(-Component, names_to = "var_raw", values_to = "Wilcoxon_q") %>%
+  mutate(
+    Component = as.integer(gsub("Component_", "", Component)),
+    Variable  = clean_var(var_raw)
+  ) %>%
+  select(Component, Variable, Wilcoxon_q)
+
+# ---------- Merge ----------
+merged <- mlr_clean %>%
+  left_join(wilcox_tidy, by = c("Component", "Variable")) %>%
+  arrange(Component, Variable, MLR_q)
+
+merged_sig <- merged %>%
+  filter(Wilcoxon_q < alpha | MLR_q < alpha | MLR_p < alpha)
+
+# ---------- Pretty table with bolded significant values ----------
+tbl <- merged_sig %>%
+  mutate(
+    Component_lbl = paste0("Component ", Component)
+  ) %>%
+  gt(groupname_col = "Component_lbl") %>%
+  cols_label(
+    Variable    = "Metadata Variable",
+    Level       = "Level (MLR term)",
+    Wilcoxon_q  = html("Wilcoxon q <span style='font-weight:400'>(BH)</span>"),
+    Estimate    = "MLR estimate",
+    CI          = "95% CI",
+    MLR_p       = "MLR p",
+    MLR_q       = html("MLR q <span style='font-weight:400'>(BH)</span>")
+  ) %>%
+  fmt_number(columns = c(Estimate), decimals = 3) %>%
+  fmt_scientific(columns = c(Wilcoxon_q, MLR_p, MLR_q), decimals = 2) %>%
+  tab_header(
+    title = md("**Shao2019 Wilcoxon & Multiple Linear Regression Results**"),
+    subtitle = "Wilcoxon BH q-values repeated per MLR level; bold = p/q < 0.05"
+  ) %>%
+  # bold significant cells
+  tab_style(
+    style = cell_text(weight = "bold"),
+    locations = list(
+      cells_body(columns = Wilcoxon_q, rows = Wilcoxon_q < alpha),
+      cells_body(columns = MLR_p,      rows = MLR_p      < alpha),
+      cells_body(columns = MLR_q,      rows = MLR_q      < alpha)
+    )
+  ) %>%
+  tab_options(
+    table.border.top.color = "black",
+    table.border.bottom.color = "black",
+    column_labels.border.bottom.color = "black",
+    heading.border.bottom.color = "black",
+    table.font.size = "small",
+    data_row.padding = px(4)
+  )
+
+tbl
+
+```

@@ -1,0 +1,1224 @@
+---
+title: "Fujita_maybefinal"
+format: html
+editor: visual
+---
+
+# vanderPloeg2024
+
+Library loading
+
+```{r}
+library(rTensor)
+library(tidyr)
+library(parafac4microbiome)
+library(zinbwave)
+library(ggplot2)
+library(ggpubr)
+library(reshape2)
+library(SummarizedExperiment)
+library(dplyr)
+library(SingleCellExperiment)
+library(gridExtra)
+library(viridis)
+library(stringr)
+library(MASS)
+library(scales)
+library(plotly)
+library(RColorBrewer)
+library(tibble)
+library(cowplot)  
+library(grid)
+library(purrr)
+library(gt)
+```
+
+### Sparsity preprocessing and unfolding into 2D matrix
+
+```{r}
+vdP_sparsityprocessed = processDataCube(vanderPloeg2024$upper_jaw_lingual, sparsityThreshold=0.50, considerGroups=TRUE, groupVariable="RFgroup",CLR = FALSE, centerMode = FALSE, scaleMode = FALSE)
+
+vdP_mode1 <- vdP_sparsityprocessed$mode1
+vdP_mode2 <- vdP_sparsityprocessed$mode2
+vdP_mode3 <- vdP_sparsityprocessed$mode3
+
+vdP_tensor <- as.tensor(vdP_sparsityprocessed$data)
+
+#unfolding along mode 1 (subject) and 3 (time) for rows, and mode 2 (taxa) for columns
+#matrix w each row = subject-time combination + each column = a taxon
+vdP_unfolded_tensor <- unfold(vdP_tensor, row_idx = c(1, 3), col_idx = 2)
+
+#from unfolded tensor to matrix
+vdP_matrix <- vdP_unfolded_tensor@data
+
+#row names combining replicate.id and time point
+vdP_row_names <- apply(expand.grid(vdP_mode1$subject, vdP_mode3$visit), 1, paste, collapse = "_")
+rownames(vdP_matrix) <- vdP_row_names
+
+#ASVs from mode2 as column names
+colnames(vdP_matrix) <- vdP_mode2$asv
+```
+
+### zinbFit
+
+```{r}
+#transposing the matrix so taxa are rows and replicates are columns
+vdP_Y_matrix <- t(vdP_matrix)
+
+#Fit ZINB model
+vdP_zinb_model_1 <- zinbFit(
+  Y = vdP_Y_matrix, 
+  #X = design_matrix,
+  K = 0,
+  #epsilon = 1e12, 
+  maxiter.optimize = 25, 
+  verbose = TRUE,
+  commondispersion = TRUE,
+  zeroinflation = TRUE,
+  BPPARAM = BiocParallel::SerialParam()
+)
+
+print(vdP_zinb_model_1)
+
+#getting model estimates for mu and pi
+vdP_mu_values1 <- getMu(vdP_zinb_model_1)
+vdP_pi_values1 <- getPi(vdP_zinb_model_1)
+
+#retransposing Y so it has the right orientation to calculate the residuals
+#Y_matrix_retransposed <- t(Y_matrix)
+
+vdP_residuals1 <- computeDevianceResiduals(vdP_zinb_model_1, vdP_matrix)
+```
+
+```{r}
+#row_names <- apply(expand.grid(mode1$subject, mode3$visit), 1, paste, collapse = "_")
+rownames(vdP_pi_values1) <- vdP_row_names
+colnames(vdP_pi_values1) <- vdP_mode2$asv
+
+#converting the pi_values matrix back into a tensor
+vdP_pi_tensor <- rTensor::fold(as.matrix(vdP_pi_values1),
+                      row_idx = c(1, 3),   #mode 1, replicates and mode 3, time in the rows
+                      col_idx = 2,         #mode 2, taxa in the columns
+                      modes = c(41,65,7))
+
+dim(vdP_pi_tensor)
+print(class(vdP_pi_tensor))
+```
+
+### Tensor multiplication, centering and scaling
+
+```{r}
+vdP_CLRprocessedCube <- processDataCube(vdP_sparsityprocessed, CLR = TRUE, centerMode = FALSE, scaleMode = FALSE)
+
+vdP_pi_tensor <- as.tensor(vdP_pi_tensor@data)
+vdP_CLR_cube <- as.tensor(vdP_CLRprocessedCube$data)  # CLR processed cube
+
+#multiply the pi_tensor with the CLRprocessedCube
+vdP_data_data <- (1 - vdP_pi_tensor) * vdP_CLR_cube
+
+vdP_data_list <- list(
+    data = vdP_data_data, 
+    mode1 = vdP_mode1,
+    mode2 = vdP_mode2, 
+    mode3 = vdP_mode3  
+)
+
+
+#multiwaycenter + scale 
+vdP_center_data <- multiwayCenter(vdP_data_list$data, mode = 1)
+
+vdP_preprocessed_data <- multiwayScale(vdP_center_data, mode = 2)
+
+print(vdP_preprocessed_data[,1,1])
+
+vdP_data_list <- list(
+    data = vdP_preprocessed_data, 
+    mode1 = vdP_mode1,
+    mode2 = vdP_mode2, 
+    mode3 = vdP_mode3  
+)
+```
+
+### ZINB PARAFAC
+
+```{r}
+#Setup
+set.seed(111)
+
+# Setup
+minNumComponents = 1
+maxNumComponents = 6
+numRepetitions = 5 # number of randomly initialized models
+numFolds = 8 # number of jack-knifed models
+ctol = 1e-12
+maxit = 200
+numCores= 1
+
+colourCols = c("RFgroup", "Phylum", "")
+legendTitles = c("RF group", "Phylum", "")
+xLabels = c("Subject index", "Feature index", "Time index")
+legendColNums = c(3,5,0)
+arrangeModes = c(TRUE, TRUE, FALSE)
+continuousModes = c(FALSE,FALSE,TRUE)
+
+#quality assessment metrics to determine the correct number of components
+vdP_qualityAssessment = assessModelQuality(vdP_preprocessed_data, minNumComponents, maxNumComponents, numRepetitions, ctol=ctol, maxit=maxit, numCores=numCores)
+
+
+```
+
+```{r}
+print(vdP_qualityAssessment)
+```
+
+CORCONDIA scores
+
+```{r}
+vdP_qualityAssessment$metrics$CORCONDIA
+```
+
+Stability assessments
+
+```{r}
+vdP_stabilityAssessment = assessModelStability(vdP_data_list, minNumComponents, maxNumComponents=3)
+#modelStability = assessModelStability(data_list, minNumComponents=1, maxNumComponents=3)
+```
+
+```{r}
+vdP_stabilityAssessment$modelPlots[[1]]
+```
+
+```{r}
+vdP_stabilityAssessment$modelPlots[[2]]
+```
+
+```{r}
+vdP_stabilityAssessment$modelPlots[[3]]
+```
+
+```{r}
+print(vdP_stabilityAssessment$FMSplot)
+```
+
+ZINB PARAFAC plot
+
+```{r}
+numComponents = 2
+vdP_modelChoice = which(vdP_qualityAssessment$metrics$varExp[,numComponents] == max(vdP_qualityAssessment$metrics$varExp[,numComponents]))
+vdP_finalModel = vdP_qualityAssessment$models[[numComponents]][[vdP_modelChoice]]
+
+plotPARAFACmodel(vdP_finalModel$Fac, vdP_data_list, 2, colourCols, legendTitles, xLabels, legendColNums, arrangeModes,
+  continuousModes = c(FALSE,FALSE,TRUE),
+  overallTitle = "van der Ploeg ZINB-PARAFAC model")
+```
+
+Flipping
+
+```{r}
+vdP_finalModel$Fac[[1]][,1] = -1 * vdP_finalModel$Fac[[1]][,1] # mode 1 component 1
+vdP_finalModel$Fac[[3]][,1] = -1 * vdP_finalModel$Fac[[3]][,1] # mode 3 component 1
+# #finalModel$Fac[[3]] = -1 * finalModel$Fac[[3]]         # all of mode 3
+
+plotPARAFACmodel(vdP_finalModel$Fac, vdP_data_list, 2, colourCols, legendTitles, xLabels, legendColNums, arrangeModes, continuousModes = c(FALSE,FALSE,TRUE), overallTitle = "van der Ploeg ZINB-PARAFAC model")
+
+
+```
+
+Variance Explained
+
+```{r}
+vdP_finalModel$varExp
+```
+
+# parafac4microbiome vanderPloeg2024
+
+As done in <https://grvanderploeg.com/parafac4microbiome/articles/vanderPloeg2024.html>
+
+```{r}
+processedPloeg = processDataCube(vanderPloeg2024$upper_jaw_lingual, sparsityThreshold=0.50, considerGroups=TRUE, groupVariable="RFgroup", CLR=TRUE, centerMode=1, scaleMode=2)
+
+set.seed(111)
+# Setup
+minNumComponents = 1
+maxNumComponents = 6
+numRepetitions = 5 # number of randomly initialized models
+numFolds = 8 # number of jack-knifed models
+ctol = 1e-12
+maxit = 200
+numCores= 1
+
+colourCols = c("RFgroup", "Phylum", "")
+legendTitles = c("RF group", "Phylum", "")
+xLabels = c("Subject index", "Feature index", "Time index")
+legendColNums = c(3,5,0)
+arrangeModes = c(TRUE, TRUE, FALSE)
+continuousModes = c(FALSE,FALSE,TRUE)
+
+#metrics to determine the correct number of components
+qualityAssessment = assessModelQuality(processedPloeg$data, minNumComponents, maxNumComponents, numRepetitions, ctol=ctol, maxit=maxit, numCores=numCores)
+
+
+qualityAssessment$plots$overview
+
+```
+
+```{r}
+qualityAssessment$metrics$CORCONDIA
+```
+
+```{r}
+p4m_vdP_stabilityAssessment = assessModelStability(processedPloeg, minNumComponents=1, maxNumComponents=5, numFolds=numFolds, considerGroups=FALSE,
+                                           groupVariable="", colourCols, legendTitles, xLabels, legendColNums, arrangeModes,
+                                           ctol=ctol, maxit=maxit, numCores=numCores)
+p4m_vdP_stabilityAssessment$modelPlots[[1]]
+
+p4m_vdP_stabilityAssessment$modelPlots[[2]]
+
+p4m_vdP_stabilityAssessment$modelPlots[[3]]
+
+p4m_vdP_stabilityAssessment$modelPlots[[4]]
+```
+
+```{r}
+numComponents = 2
+modelChoice = which(qualityAssessment$metrics$varExp[,numComponents] == max(qualityAssessment$metrics$varExp[,numComponents]))
+originalModel_vdP = qualityAssessment$models[[numComponents]][[modelChoice]]
+```
+
+```{r}
+originalModel_vdP = flipLoadings(originalModel_vdP, processedPloeg$data)
+
+plotPARAFACmodel(originalModel_vdP$Fac, processedPloeg, 2, colourCols, legendTitles, xLabels, legendColNums, arrangeModes, continuousModes,
+  overallTitle = "vanderPloeg2024 PARAFAC model")
+
+originalModel_vdP$varExp
+```
+
+# Canonical Correlation Analysis
+
+```{r}
+#mode loadings selection
+subject_loadings_original_vdP <- originalModel_vdP$Fac[[1]]  
+subject_loadings_zinb_vdP <- vdP_finalModel$Fac[[1]]
+
+feat_loadings_original_vdP <- originalModel_vdP$Fac[[2]]  
+feat_loadings_zinb_vdP <- vdP_finalModel$Fac[[2]]
+
+time_loadings_original_vdP <- originalModel_vdP$Fac[[3]]  
+time_loadings_zinb_vdP <- vdP_finalModel$Fac[[3]]
+```
+
+```{r}
+
+#CCA for each mode
+cca_subjects <- cancor(subject_loadings_original_vdP, subject_loadings_zinb_vdP)
+cca_features <- cancor(feat_loadings_original_vdP, feat_loadings_zinb_vdP)
+cca_time <- cancor(time_loadings_original_vdP, time_loadings_zinb_vdP)
+
+# Plot settings
+par(mfrow = c(1, 1))
+
+#Subjects mode
+subject_variates_original <- subject_loadings_original_vdP %*% cca_subjects$xcoef
+subject_variates_zinb <- subject_loadings_zinb_vdP %*% cca_subjects$ycoef
+plot(subject_variates_original[, 1], subject_variates_zinb[, 1],
+     xlab = "p4m PARAFAC",
+     ylab = "ZINB-PARAFAC",
+     main = "Subjects Mode",
+     pch = 16, col = "pink", cex = 1.2) 
+abline(a = 0, b = 1, col = "red", lwd = 2, lty = 2)  
+
+#Features mode
+feature_variates_original <- feat_loadings_original_vdP %*% cca_features$xcoef
+feature_variates_zinb <- feat_loadings_zinb_vdP %*% cca_features$ycoef
+plot(feature_variates_original[, 1], feature_variates_zinb[, 1],
+     xlab = "p4m PARAFAC",
+     ylab = "ZINB-PARAFAC",
+     main = "Features Mode",
+     pch = 16, col = "darkgreen", cex = 1.2) 
+abline(a = 0, b = 1, col = "red", lwd = 2, lty = 2) 
+
+
+#Time mode
+time_variates_original <- time_loadings_original_vdP %*% cca_time$xcoef
+time_variates_zinb <- time_loadings_zinb_vdP %*% cca_time$ycoef
+plot(time_variates_original[, 1], time_variates_zinb[, 1],
+     xlab = "p4m PARAFAC",
+     ylab = "ZINB-PARAFAC",
+     main = "Time Mode",
+     pch = 16, col = "skyblue", cex = 1.2)
+abline(a = 0, b = 1, col = "red", lwd = 2, lty = 2)  
+
+```
+
+```{r}
+# CCA 
+cca_subjects <- cancor(subject_loadings_original_vdP, subject_loadings_zinb_vdP)
+cca_features <- cancor(feat_loadings_original_vdP,   feat_loadings_zinb_vdP)
+cca_time     <- cancor(time_loadings_original_vdP,   time_loadings_zinb_vdP)
+
+# Canonical variates (first pair)
+subject_x <- subject_loadings_original_vdP %*% cca_subjects$xcoef
+subject_y <- subject_loadings_zinb_vdP     %*% cca_subjects$ycoef
+
+feature_x <- feat_loadings_original_vdP    %*% cca_features$xcoef
+feature_y <- feat_loadings_zinb_vdP        %*% cca_features$ycoef
+
+time_x    <- time_loadings_original_vdP    %*% cca_time$xcoef
+time_y    <- time_loadings_zinb_vdP        %*% cca_time$ycoef
+
+# Use first canonical variate only
+sx <- subject_x[,1]; sy <- subject_y[,1]
+fx <- feature_x[,1]; fy <- feature_y[,1]
+tx <- time_x[,1];    ty <- time_y[,1]
+
+# Common limits across all modes
+lims <- range(c(sx, sy, fx, fy, tx, ty), finite = TRUE)
+
+# Colors
+subj_col <- adjustcolor("pink",       alpha.f = 0.9)
+feat_col <- adjustcolor("green",  alpha.f = 0.1)
+time_col <- adjustcolor("skyblue",    alpha.f = 0.7)
+
+# One combined plot
+par(mfrow = c(1,1))
+plot(NA, xlim = lims, ylim = lims, asp = 1,
+     xlab = "p4m PARAFAC (1st canonical variate)",
+     ylab = "ZINB-PARAFAC (1st canonical variate)",
+     main = "CCA: First Canonical Scores — All Modes")
+abline(a = 0, b = 1, col = "red", lwd = 2, lty = 2)
+grid()
+
+points(sx, sy, pch = 16, col = subj_col, cex = 1.2)
+points(fx, fy, pch = 16, col = feat_col, cex = 1.2)
+points(tx, ty, pch = 16, col = time_col, cex = 1.2)
+
+legend("topleft",
+       legend = c("Subjects", "Features", "Time"),
+       pch = 16, col = c(subj_col, feat_col, time_col),
+       pt.cex = 1.2, bty = "n")
+
+```
+
+```{r}
+#' Compute Factor Match Score for two models.
+
+
+FMS_random = function(Fac1, Fac2){
+
+  # Make robust towards 1-component case
+  Fac1 = lapply(Fac1, as.matrix)
+  Fac2 = lapply(Fac2, as.matrix)
+
+  # Setup
+  numComponents = ncol(Fac1[[1]])
+  numModes = length(Fac1)
+
+  stopifnot(length(Fac1) == length(Fac2))
+
+  FMSresult = matrix(1L, nrow=numComponents, ncol=numComponents)
+  for(i in 1:numModes){
+    similarityMatrix = matrix(0L, nrow=numComponents, ncol=numComponents)
+
+    for(j in 1:numComponents){
+      for(k in 1:numComponents){
+        vect1 = as.matrix(Fac1[[i]][,j])
+        vect2 = as.matrix(Fac2[[i]][,k])
+        similarityMatrix[j,k] = abs(t(vect1) %*% vect2) / (norm(vect1, "F") * norm(vect2, "F"))
+      }
+    }
+    FMSresult = FMSresult * similarityMatrix
+  }
+
+  # Find best combination
+  mapping = clue::solve_LSAP(FMSresult, maximum=TRUE)
+
+  # Find mapping matrix and calculate FMS
+  mappingMatrix = cbind(seq_along(mapping), mapping)
+
+  result = (sum(FMSresult[mappingMatrix])) / numComponents
+
+  return(result)
+}
+
+
+
+Fac1 <- originalModel_vdP$Fac[1:3]  
+Fac2 <- vdP_finalModel$Fac[1:3]        
+
+vdp_fms_score <- FMS_random(Fac1, Fac2)
+
+print(vdp_fms_score)
+```
+
+### Tucker Congruence Coefficient Heatmap
+
+```{r}
+calculateTCC = function(vect1, vect2){
+vect1 = as.matrix(vect1)
+vect2 = as.matrix(vect2)
+FMS = abs(t(vect1) %*% vect2) / (norm(vect1, "F") * norm(vect2, "F"))
+return(FMS)
+}
+```
+
+```{r}
+compute_tcc_matrix <- function(mat1, mat2) {
+  n1 <- ncol(mat1)
+  n2 <- ncol(mat2)
+  tcc_mat <- matrix(NA, nrow = n1, ncol = n2)
+  for (i in 1:n1) {
+    for (j in 1:n2) {
+      tcc_mat[i, j] <- calculateTCC(mat1[, i], mat2[, j])
+    }
+  }
+  rownames(tcc_mat) <- paste0("parafac4microbiome_", 1:n1)
+  colnames(tcc_mat) <- paste0("ZINB-WaVe_", 1:n2)
+  return(tcc_mat)
+}
+
+```
+
+```{r}
+#calculation of TCC matrices for each mode
+subject_tcc_matrix_vdP <- compute_tcc_matrix(subject_loadings_original_vdP, subject_loadings_zinb_vdP)
+feature_tcc_matrix_vdP <- compute_tcc_matrix(feat_loadings_original_vdP, feat_loadings_zinb_vdP)
+time_tcc_matrix_vdP    <- compute_tcc_matrix(time_loadings_original_vdP, time_loadings_zinb_vdP)
+
+
+pheatmap(subject_tcc_matrix_vdP,
+         cluster_rows = FALSE, cluster_cols = FALSE,
+         main = "TCC Heatmap - Subject Mode (vdP)", display_numbers = TRUE, 
+         color = colorRampPalette(c("white", "pink"))(50))
+
+pheatmap(feature_tcc_matrix_vdP,
+         cluster_rows = FALSE, cluster_cols = FALSE,
+         main = "TCC Heatmap - Feature Mode (vdP)", display_numbers = TRUE, 
+         color = colorRampPalette(c("white", "darkgreen"))(50))
+
+pheatmap(time_tcc_matrix_vdP,
+         cluster_rows = FALSE, cluster_cols = FALSE,
+         main = "TCC Heatmap - Time Mode (vdP)", display_numbers = TRUE, 
+         color = colorRampPalette(c("white", "skyblue"))(50))
+
+```
+
+```{r}
+
+lims <- c(0, 1)
+
+make_panel <- function(df_mode, title, high_col, lims) {
+  ggplot(df_mode, aes(x = p4m, y = ZINB, fill = TCC)) +
+    geom_tile(color = "white", linewidth = 0.8) +
+    geom_text(aes(label = sprintf("%.2f", TCC)),
+              size = 4, fontface = "bold", color = "grey10") +
+    scale_fill_gradient(low = "white", high = high_col,
+                        limits = lims, oob = scales::squish, name = "TCC") +
+    scale_x_discrete(labels = function(l) sub(".*_(\\d+)$", "\\1", l)) +
+    scale_y_discrete(labels = function(l) sub(".*_(\\d+)$", "\\1", l)) +
+    coord_fixed() +
+    labs(title = title, x = "parafac4microbiome component", y = "ZINB-WaVe component") +
+    theme_minimal(base_size = 12) +
+    theme(panel.grid = element_blank(),
+          plot.title = element_text(face = "bold", hjust = 0.5))
+}
+
+p_subj <- make_panel(df_subj, "Subjects", "#CC79A7", lims)
+p_feat <- make_panel(df_feat, "Features", "#009E73", lims)
+p_time <- make_panel(df_time, "Time",     "#56B4E9", lims)
+
+(p_subj | p_feat | p_time) +
+  plot_annotation(title = "TCC heatmaps — vanderPloeg2024") &
+  theme(plot.title = element_text(face = "bold", size = 14, hjust = 0.5))
+
+```
+
+# Plots
+
+mu and pi values
+
+```{r}
+hist(vdP_residuals1, breaks = 100, main = "Histogram of Deviance Residuals in vanderPloeg2024", xlab = "Residuals", col = "skyblue")
+
+hist(vdP_pi_values1, breaks = 100, main = "Histogram of Zero Inflation Probabilities in vanderPloeg2024", xlab = "Probability of excess zero (π)", col = "orange")
+```
+
+density plot
+
+```{r}
+#masks for zero and non-zero values in Fujita_matrix
+vdP_zero_mask <- vdP_matrix == 0
+vdP_non_zero_mask <- vdP_matrix != 0
+
+#filter corresponding values 
+vdP_pi_values_zeros1 <- vdP_pi_values1[vdP_zero_mask]
+vdP_pi_values_non_zeros1 <- vdP_pi_values1[vdP_non_zero_mask]
+
+#new data frame
+vdP_plot_data <- data.frame(
+  value = c(vdP_pi_values_zeros1, vdP_pi_values_non_zeros1),
+  group = factor(c(rep("Zero counts", length(vdP_pi_values_zeros1)),
+                   rep("Non-zero counts", length(vdP_pi_values_non_zeros1))))
+)
+
+#density plot
+ggplot(vdP_plot_data, aes(x = value, fill = group)) +
+  geom_density(alpha = 0.5) + 
+  labs(title = "Density Plot of π values (vanderPloeg2024) ",
+       x = " π ",
+       y = "Probability Density") +
+  theme_minimal() +
+  scale_fill_manual(values = c("Zero counts" = "#00AFBB", "Non-zero counts" = "#E7B800"))+
+  theme(plot.title = element_text(hjust = 0.5))
+```
+
+Observed vs Simulated Zeros
+
+```{r}
+vdP_observed_zeros <- rowSums(vdP_matrix == 0)
+vdP_simulated <- zinbSim(vdP_zinb_model_1)
+vdP_simulated_counts <- as.data.frame(vdP_simulated$counts)
+vdP_simulated_counts <-t(vdP_simulated_counts)
+vdP_simulated_zeros <- rowSums(vdP_simulated_counts == 0)
+#print(nrow(Y_matrix_retransposed))
+#print(nrow(simulated_counts))
+
+#linear model fit
+vdP_zero_fit <- lm(vdP_simulated_zeros ~ vdP_observed_zeros)
+
+#summary to get R-squared and p-value
+summary(vdP_zero_fit)
+
+#extract values
+vdP_fit_summary <- summary(vdP_zero_fit)
+vdP_r_squared <- round(vdP_fit_summary$r.squared, 3)
+vdP_p_value <- signif(vdP_fit_summary$coefficients[2, 4], 3)
+
+#plot with annotation
+plot(vdP_observed_zeros, vdP_simulated_zeros,
+     main = "Observed vs Simulated Zeros in vanderPloeg2024",
+     xlab = "Observed Zeros", ylab = "Simulated Zeros")
+abline(0, 1, col = "blue")  # reference line
+abline(vdP_zero_fit, col = "red", lty = 2)  # regression line
+legend("topleft",
+       legend = paste0("R² = ", vdP_r_squared, "\nP = ", vdP_p_value),
+       bty = "n")
+```
+
+```{r}
+plot_avg_simulated_zeros <- function(count_matrix, zinb_model, 
+                                     n_sims = 50, seed = 42, 
+                                     dataset_name = "Dataset") {
+  set.seed(seed)
+  
+  #observed zeros per sample
+  observed_zeros <- rowSums(count_matrix == 0)
+  
+  #run multiple simulations and collect zero counts
+  sim_zeros_mat <- replicate(
+    n_sims,
+    {
+      sim <- zinbSim(zinb_model)
+      sim_counts <- t(as.data.frame(sim$counts))  # transpose: rows = samples
+      rowSums(sim_counts == 0)
+    },
+    simplify = "matrix"
+  )
+  
+  #average simulated zeros per sample
+  simulated_zeros_avg <- rowMeans(sim_zeros_mat)
+  
+  #Fit regression
+  zero_fit <- lm(simulated_zeros_avg ~ observed_zeros)
+  fit_summary <- summary(zero_fit)
+  
+  #stats
+  r_squared <- round(fit_summary$r.squared, 3)
+  p_value   <- signif(fit_summary$coefficients[2, 4], 3)
+  
+  #plotting
+  plot(
+    observed_zeros, simulated_zeros_avg,
+    main = paste0("Observed vs Averaged Simulated Zeros (", n_sims, " sims) — ", dataset_name),
+    xlab = "Observed Zeros per Sample",
+    ylab = paste0("Simulated Zeros per Sample (average of ", n_sims, " sims)")
+  )
+  abline(0, 1, col = "blue")                 # 1:1 reference line
+  abline(zero_fit, col = "red", lty = 2)     # regression fit
+  legend(
+    "topleft",
+    legend = paste0("R² = ", r_squared, "\nP = ", p_value),
+    bty = "n"
+  )
+  
+  #return stats
+  invisible(list(
+    fit = zero_fit,
+    summary = fit_summary,
+    R2 = r_squared,
+    pval = p_value
+  ))
+}
+
+```
+
+```{r}
+plot_avg_simulated_zeros(vdP_matrix, vdP_zinb_model_1, 
+                         n_sims = 50, dataset_name = "van der Ploeg 2024")
+```
+
+```{r}
+#dimensions
+n_subj_vdp   <- dim(vdP_sparsityprocessed$data)[1]
+n_feat_vdp   <- dim(vdP_sparsityprocessed$data)[2]
+n_time_vdp   <- dim(vdP_sparsityprocessed$data)[3]
+
+#data frame of all coordinate triples
+coords_vdp <- expand.grid(
+  subject = seq_len(n_subj_vdp),
+  feature = seq_len(n_feat_vdp),
+  time    = seq_len(n_time_vdp)
+)
+
+#flatten
+coords_vdp$counts <- as.vector(vdP_sparsityprocessed$data)
+coords_vdp$pi <- as.vector(vdP_pi_tensor@data)
+
+#we are only interested in the zero-count entries:
+zeros_vdP <- subset(coords_vdp, counts == 0)
+
+#3D plot, coloring points by pi
+plot_ly(
+  data = zeros_vdP,
+  x = ~subject,
+  y = ~feature,
+  z = ~time,
+  color = ~pi,
+  type = "scatter3d",
+  mode = "markers",
+  marker = list(size = 3)
+) %>%
+  plotly::layout(
+    scene = list(
+      xaxis = list(title = "Subject"),
+      yaxis = list(title = "Feature"),
+      zaxis = list(title = "Time")
+    ),
+    title = "Zero Counts Colored by ZINB pi - vdP"
+  )
+
+```
+
+### Final grid plot
+
+```{r}
+#loadings + metadata
+vdp_combined_data <- cbind(vdP_data_list$mode1, vdP_finalModel$Fac[[1]]) %>% as_tibble()
+
+# Component 1 – Subject mode
+vdp_subject_plot1 <- vdp_combined_data %>%
+  pivot_longer(-c(RFgroup, subject)) %>%
+  filter(name == 1, RFgroup != 1) %>%
+  ggplot(aes(x = as.factor(RFgroup), y = value, fill = as.factor(RFgroup))) +
+  geom_boxplot(outlier.shape = NA, width = 0.7, alpha = 0.7) +
+  geom_jitter(width = 0.15, alpha = 0.5) +  
+  stat_compare_means(method = "wilcox.test", label = "p.format") +
+  labs(
+    title = "Component 1 vs RF Group",
+    subtitle = "Wilcoxon test",
+    x = "RF Group",
+    y = "Component 1 Value",
+    fill = "RF Group"
+  ) +
+  scale_fill_viridis_d(option = "plasma", begin = 0.1, end = 0.9) +
+  scale_x_discrete(labels = c("0" = "Low", "2" = "High")) +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "none")
+
+# Component 2 – Subject mode
+vdp_subject_plot2 <- vdp_combined_data %>%
+  pivot_longer(-c(RFgroup, subject)) %>%
+  filter(name == 2, RFgroup != 1) %>%
+  ggplot(aes(x = as.factor(RFgroup), y = value, fill = as.factor(RFgroup))) +
+  geom_boxplot(outlier.shape = NA, width = 0.7, alpha = 0.7) +
+  geom_jitter(width = 0.15, alpha = 0.5) +  
+  stat_compare_means(method = "wilcox.test", label = "p.format") +
+  labs(
+    title = "Component 2 vs RF Group",
+    subtitle = "Wilcoxon test",
+    x = "RF Group",
+    y = "Component 2 Value",
+    fill = "RF Group"
+  ) +
+  scale_fill_viridis_d(option = "plasma", begin = 0.1, end = 0.9) +
+  scale_x_discrete(labels = c("0" = "Low", "2" = "High")) +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "bottom")
+
+ggarrange(vdp_subject_plot1, vdp_subject_plot2, nrow = 1)
+```
+
+```{r}
+
+#Colours
+colours     <- brewer.pal(8, "Dark2")
+phylum_cols <- colours[-c(1:2)]
+
+#format labels
+format_taxa_names <- function(genus, species) {
+  ifelse(
+    is.na(genus),
+    "Unclassified",
+    ifelse(
+      is.na(species) | species == "",
+      paste0(genus, " sp."),
+      paste0(genus, " ", species)
+    )
+  )
+}
+
+# function to pick top + bottom n
+get_top_bottom <- function(data, comp_col, n = 10) {
+  top    <- data %>% arrange(desc(!!sym(comp_col))) %>% slice_head(n = n)
+  bottom <- data %>% arrange(!!sym(comp_col))        %>% slice_head(n = n)
+  bind_rows(top, bottom) %>% arrange(!!sym(comp_col))
+}
+
+#raw taxa matrix + metadata
+raw_taxa <- cbind(vdP_finalModel$Fac[[2]], vdP_data_list$mode2) %>%
+  as_tibble()
+
+#How many to show
+n <- 10
+
+#Component 1
+df1 <- raw_taxa %>%
+  get_top_bottom("1", n) %>%
+  mutate(
+    index = row_number(),
+    label = format_taxa_names(Genus, Species)
+  )
+
+vdp_taxa_plot1 <- ggplot(df1, aes(x = `1`, y = factor(index), fill = factor(Phylum))) +
+  geom_col() +
+  labs(
+    x    = "Component 1 loading",
+    y    = "Taxon",
+    fill = "Phylum"
+  ) +
+  scale_y_discrete(labels = df1$label) +
+  scale_fill_manual(
+    values = phylum_cols,
+    labels = c("Actinobacteria","Bacteroidetes","Firmicutes","Proteobacteria","Unclassified")
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "none")
+
+#Component 2
+df2 <- raw_taxa %>%
+  get_top_bottom("2", n) %>%
+  mutate(
+    index = row_number(),
+    label = format_taxa_names(Genus, Species)
+  )
+
+vdp_taxa_plot2 <- ggplot(df2, aes(x = `2`, y = factor(index), fill = factor(Phylum))) +
+  geom_col() +
+  labs(
+    x    = "Component 2 loading",
+    y    = "Taxon",
+    fill = "Phylum"
+  ) +
+  scale_y_discrete(labels = df2$label) +
+  scale_fill_manual(
+    values = phylum_cols,
+    labels = c("Actinobacteria","Bacteroidetes","Firmicutes","Proteobacteria","Unclassified")
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "none")
+
+
+ggarrange(vdp_taxa_plot1, vdp_taxa_plot2, nrow = 1)
+
+
+```
+
+```{r}
+# Time loadings
+vdp_time_df <- as_tibble(vdP_finalModel$Fac[[3]]) %>%
+  setNames(c("Comp1", "Comp2")) %>%
+  mutate(Timestep = 1:n())
+
+# Component 1 – Time
+vdp_time_plot1 <- ggplot(vdp_time_df, aes(x = Timestep, y = Comp1)) +
+  geom_line(color = "#377EB8", size = 1.2) +
+  geom_point(color = "#377EB8", size = 2) +
+  labs(title = "Component 1", x = "Time Point", y = "Loading") +
+  theme_minimal(base_size = 12)
+
+# Component 2 – Time
+vdp_time_plot2 <- ggplot(vdp_time_df, aes(x = Timestep, y = Comp2)) +
+  geom_line(color = "#377EB8", size = 1.2) +
+  geom_point(color = "#377EB8", size = 2) +
+  labs(title = "Component 2", x = "Time Point", y = "Loading") +
+  theme_minimal(base_size = 12)
+
+```
+
+```{r}
+grid.arrange(
+  textGrob("Subject Loadings", gp = gpar(fontsize = 14, fontface = "bold")), textGrob("Taxa Loadings", gp = gpar(fontsize = 14, fontface = "bold")), textGrob("Time Loadings", gp = gpar(fontsize = 14, fontface = "bold")),
+  vdp_subject_plot1, vdp_taxa_plot1, vdp_time_plot1,
+  vdp_subject_plot2, vdp_taxa_plot2, vdp_time_plot2,
+  ncol = 3,
+  heights = c(0.5, 5, 5)  # control title height
+)
+```
+
+```{r}
+
+# vdP final grid with title + shared Phylum legend
+
+# ---------- Parameters ----------
+n_top_bottom <- 10  # show top & bottom taxa per component
+main_title   <- "van der Ploeg 2024 ZINB-WaVe PARAFAC model"
+
+# ---------- Helpers ----------
+format_taxa_names <- function(genus, species) {
+  ifelse(
+    is.na(genus) | genus == "",
+    "Unclassified",
+    ifelse(is.na(species) | species == "",
+           paste0(genus, " sp."),
+           paste0(genus, " ", species))
+  )
+}
+
+get_top_bottom <- function(data, comp_col, n = 10) {
+  top    <- data %>% arrange(desc(!!rlang::sym(comp_col))) %>% slice_head(n = n)
+  bottom <- data %>% arrange(!!rlang::sym(comp_col))        %>% slice_head(n = n)
+  bind_rows(top, bottom) %>% arrange(!!rlang::sym(comp_col))
+}
+
+# ---------- Palette (5 phyla) ----------
+phylum_levels  <- c("Actinobacteria", "Bacteroidetes", "Firmicutes", "Proteobacteria", "Unclassified")
+phylum_palette <- setNames(brewer.pal(length(phylum_levels), "Dark2"), phylum_levels)
+
+# ---------- SUBJECTS ----------
+vdp_combined_data <- cbind(vdP_data_list$mode1, vdP_finalModel$Fac[[1]]) %>% as_tibble()
+
+vdp_subject_plot1 <- vdp_combined_data %>%
+  pivot_longer(-c(RFgroup, subject)) %>%
+  filter(name == 1, RFgroup != 1) %>%
+  ggplot(aes(x = as.factor(RFgroup), y = value, fill = as.factor(RFgroup))) +
+  geom_boxplot(outlier.shape = NA, width = 0.7, alpha = 0.7) +
+  geom_jitter(width = 0.15, alpha = 0.5) +
+  stat_compare_means(method = "wilcox.test", label = "p.format") +
+  labs(title = "Component 1 vs RF Group", subtitle = "Wilcoxon test",
+       x = "RF Group", y = "Component 1 Value", fill = "RF Group") +
+  scale_fill_viridis_d(option = "plasma", begin = 0.1, end = 0.9) +
+  scale_x_discrete(labels = c("0" = "Low", "2" = "High")) +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "none")
+
+vdp_subject_plot2 <- vdp_combined_data %>%
+  pivot_longer(-c(RFgroup, subject)) %>%
+  filter(name == 2, RFgroup != 1) %>%
+  ggplot(aes(x = as.factor(RFgroup), y = value, fill = as.factor(RFgroup))) +
+  geom_boxplot(outlier.shape = NA, width = 0.7, alpha = 0.7) +
+  geom_jitter(width = 0.15, alpha = 0.5) +
+  stat_compare_means(method = "wilcox.test", label = "p.format") +
+  labs(title = "Component 2 vs RF Group", subtitle = "Wilcoxon test",
+       x = "RF Group", y = "Component 2 Value", fill = "RF Group") +
+  scale_fill_viridis_d(option = "plasma", begin = 0.1, end = 0.9) +
+  scale_x_discrete(labels = c("0" = "Low", "2" = "High")) +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "none")
+
+# ---------- TAXA ----------
+# raw taxa matrix + metadata (expects columns: Genus, Species, Phylum in vdP_data_list$mode2)
+raw_taxa <- cbind(vdP_finalModel$Fac[[2]], vdP_data_list$mode2) %>% as_tibble()
+
+# ---- Harmonize phylum names ----
+raw_taxa <- raw_taxa %>%
+  mutate(
+    Phylum = trimws(as.character(Phylum)),
+    Phylum = dplyr::na_if(Phylum, ""),
+    Phylum = dplyr::recode(
+      Phylum,
+      "Bacteroidota"      = "Bacteroidetes",
+      "Actinobacteriota"  = "Actinobacteria",
+      "Firmicutes_A"      = "Firmicutes",
+      "Firmicutes_B"      = "Firmicutes",
+      "Fusobacteriota"    = "Fusobacteria",   # <-- add this
+      .default = Phylum
+    ),
+    Phylum = tidyr::replace_na(Phylum, "Unclassified")
+  )
+
+# ---- Build levels from what's actually present ----
+phylum_levels  <- sort(unique(raw_taxa$Phylum))
+
+
+
+
+cols <- RColorBrewer::brewer.pal(8, "Dark2")
+
+phylum_palette <- c(
+  "Actinobacteria" = cols[3],  # greenish
+  "Bacteroidetes"  = cols[4],  # orange
+  "Firmicutes"     = cols[5],  # pink
+  "Proteobacteria" = cols[6],  # purple
+  "Fusobacteria"   = cols[2],  # bluish
+  "Unclassified"   = cols[7]   # grayish
+)
+
+phylum_levels <- names(phylum_palette)
+
+# Component 1 taxa bars
+df1 <- raw_taxa %>%
+  get_top_bottom("1", n_top_bottom) %>%
+  mutate(index = dplyr::row_number(),
+         label = format_taxa_names(Genus, Species))
+
+vdp_taxa_plot1 <- ggplot(df1, aes(x = `1`, y = factor(index), fill = Phylum)) +
+  geom_col() +
+  labs(x = "Component 1 loading", y = "Taxon", fill = "Phylum") +
+  scale_y_discrete(labels = df1$label) +
+  scale_fill_manual(values = phylum_palette, limits = phylum_levels, drop = FALSE) +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "none")
+
+# Component 2 taxa bars
+df2 <- raw_taxa %>%
+  get_top_bottom("2", n_top_bottom) %>%
+  mutate(index = dplyr::row_number(),
+         label = format_taxa_names(Genus, Species))
+
+vdp_taxa_plot2 <- ggplot(df2, aes(x = `2`, y = factor(index), fill = Phylum)) +
+  geom_col() +
+  labs(x = "Component 2 loading", y = "Taxon", fill = "Phylum") +
+  scale_y_discrete(labels = df2$label) +
+  scale_fill_manual(values = phylum_palette, limits = phylum_levels, drop = FALSE) +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "none")
+
+# Shared Phylum legend (bottom)
+legend_df <- tibble(Phylum = factor(phylum_levels, levels = phylum_levels), x = 1, y = 1)
+legend_plot <- ggplot(legend_df, aes(x, y, fill = Phylum)) +
+  geom_col() +
+  scale_fill_manual(values = phylum_palette, limits = phylum_levels, name = "Phylum") +
+  theme_void(base_size = 12) +
+  theme(
+    legend.position  = "bottom",
+    legend.key.size  = unit(5, "mm"),
+    legend.key.width = unit(8, "mm"),
+    legend.title     = element_text(size = 9),
+    legend.text      = element_text(size = 8)
+  ) +
+  guides(fill = guide_legend(nrow = 1, byrow = TRUE))
+shared_phylum_legend <- cowplot::get_legend(legend_plot)
+
+# ---------- TIME (mode 3) ----------
+vdp_time_df <- as_tibble(vdP_finalModel$Fac[[3]]) %>%
+  setNames(c("Comp1", "Comp2")) %>%
+  mutate(Timestep = dplyr::row_number())
+
+vdp_time_plot1 <- ggplot(vdp_time_df, aes(x = Timestep, y = Comp1)) +
+  geom_line(color = "#377EB8", size = 1.2) +
+  geom_point(color = "#377EB8", size = 2) +
+  labs(title = "Component 1", x = "Time Point", y = "Loading") +
+  theme_minimal(base_size = 12)
+
+vdp_time_plot2 <- ggplot(vdp_time_df, aes(x = Timestep, y = Comp2)) +
+  geom_line(color = "#377EB8", size = 1.2) +
+  geom_point(color = "#377EB8", size = 2) +
+  labs(title = "Component 2", x = "Time Point", y = "Loading") +
+  theme_minimal(base_size = 12)
+
+# ---------- Assemble grid with column headers, title, and shared legend ----------
+inner_grid <- gridExtra::arrangeGrob(
+  textGrob("Subject Loadings", gp = gpar(fontsize = 14, fontface = "bold")),
+  textGrob("Taxa Loadings",    gp = gpar(fontsize = 14, fontface = "bold")),
+  textGrob("Time Loadings",    gp = gpar(fontsize = 14, fontface = "bold")),
+  vdp_subject_plot1, vdp_taxa_plot1, vdp_time_plot1,
+  vdp_subject_plot2, vdp_taxa_plot2, vdp_time_plot2,
+  ncol = 3,
+  heights = c(0.6, 5, 5)
+)
+
+vdp_grid <- gridExtra::arrangeGrob(
+  inner_grid,
+  top    = textGrob(main_title, gp = gpar(fontsize = 16, fontface = "bold")),
+  bottom = shared_phylum_legend
+)
+
+# Draw
+grid.newpage()
+grid.draw(vdp_grid)
+
+# ---------- Optional: save ----------
+ggsave("figs/vdP_ZINB_PARAFAC.png", plot = vdp_grid,
+        device = ragg::agg_png, width = 13, height = 8, units = "in", dpi = 300)
+
+
+```
+
+## Metadata addition
+
+```{r}
+#demographic metadata from  mode‐1:
+demog_df <- vdP_mode1 %>%
+  select(subject, gender, age)
+
+#get day‐14 fluorescence measures:
+fluor_day14 <- vanderPloeg2024$red_fluorescence %>%
+  filter(day == 14) %>%
+  select(subject, Area_delta_R30, plaquepercent, bomppercent)
+
+
+meta_global <- demog_df %>%
+  left_join(fluor_day14, by = "subject")
+
+
+glimpse(meta_global)
+```
+
+```{r}
+
+testMetadata <- function(model, comp, meta_df) {
+  #normalize the subject‐loadings + into tibble
+  loads <- transformPARAFACloadings(model$Fac, 1)[, comp]
+  loads <- loads / norm(loads, "2")
+
+  load_df <- tibble(
+    subject = meta_df$subject,
+    loading = as.numeric(loads)
+  )
+
+  #combine loadings + metadata
+  df <- meta_df %>%
+    left_join(load_df, by = "subject")
+
+  # fit linear model
+  fit <- lm(
+    loading ~ plaquepercent + bomppercent + Area_delta_R30 + gender + age,
+    data = df
+  )
+
+  #extract coefficients + 95% CIs and return summary table
+  cm  <- summary(fit)$coefficients
+  ci  <- confint(fit)
+  keep <- rownames(cm) != "(Intercept)"
+  cm   <- cm[keep, , drop = FALSE]
+  ci   <- ci[keep, , drop = FALSE]
+
+  tibble(
+    Term     = rownames(cm),
+    Estimate = cm[, "Estimate"],
+    CI       = sprintf("%0.3f – %0.3f", ci[,1], ci[,2]),
+    P_value  = cm[, "Pr(>|t|)"],
+    P_adjust = p.adjust(cm[, "Pr(>|t|)"], method = "BH")
+  )
+}
+
+```
+
+```{r}
+
+vdp_Component1_tests <- testMetadata(vdP_finalModel, 1, meta_global)
+print(vdp_Component1_tests)
+
+vdp_Component2_tests  <- testMetadata(vdP_finalModel, 2, meta_global)
+print(vdp_Component2_tests)
+
+```
+
+```{r}
+
+# ----- helper: clean term names -----
+clean_term_vdp <- function(x){
+  if (grepl("^gender", x)) {
+    lvl <- sub("^gender", "", x)
+    lvl <- gsub("^\\.*", "", lvl)
+    return(paste0("Gender: ", str_to_title(lvl)))
+  }
+  rec <- c(
+    "plaquepercent"  = "Plaque percent",
+    "bomppercent"    = "Bleeding percent",
+    "Area_delta_R30" = "Area ΔR30",
+    "age"            = "Age"
+  )
+  if (x %in% names(rec)) return(rec[[x]])
+  str_to_sentence(gsub("_", " ", x))
+}
+
+# ----- helper: print with 3 significant figs -----
+format_sig3 <- function(x, tiny_cutoff = 1e-3){
+  ifelse(x < tiny_cutoff, "<0.001", format(signif(x, 3), scientific = FALSE, trim = TRUE))
+}
+
+# ----- main table builder -----
+mlr_vdp_table <- function(model, meta_df, alpha = 0.05){
+  ncomp <- ncol(model$Fac[[1]])
+
+  mlr_raw <- map_dfr(
+    seq_len(ncomp),
+    ~ testMetadata(model, .x, meta_df) %>% mutate(Component = .x)
+  )
+
+  df <- mlr_raw %>%
+    mutate(
+      Component_lbl = paste0("Component ", Component),
+      Term_clean    = vapply(Term, clean_term_vdp, character(1)),
+      Est_fmt       = sprintf("%.3f", Estimate),
+      p_fmt         = format_sig3(P_value),
+      q_fmt         = format_sig3(P_adjust)
+    ) %>%
+    transmute(
+      Component_lbl,
+      Term = Term_clean,
+      Estimate = Est_fmt,
+      `95% CI`  = CI,
+      `p-value` = p_fmt,
+      `q (BH)`  = q_fmt,
+      p_raw = P_value,   # keep raw for styling
+      q_raw = P_adjust
+    )
+
+  df %>%
+    gt(groupname_col = "Component_lbl") %>%
+    tab_header(
+      title = md("**Multiple Linear Regression — vanderPloeg2024**"),
+      subtitle = "Coefficients per component; bold = p/q < 0.05;"
+    ) %>%
+    cols_label(
+      Term      = "Term",
+      Estimate  = "Estimate",
+      `95% CI`  = "95% CI",
+      `p-value` = "p-value",
+      `q (BH)`  = html("q <span style='font-weight:400'>(BH)</span>")
+    ) %>%
+    tab_style(
+      style = cell_text(weight = "bold"),
+      locations = list(
+        cells_body(columns = `p-value`, rows = p_raw < alpha),
+        cells_body(columns = `q (BH)`,  rows = q_raw < alpha)
+      )
+    ) %>%
+    cols_hide(c(p_raw, q_raw)) %>%
+    tab_options(
+      table.border.top.color = "black",
+      table.border.bottom.color = "black",
+      column_labels.border.bottom.color = "black",
+      heading.border.bottom.color = "black",
+      table.font.size = "small",
+      data_row.padding = px(4)
+    )
+}
+
+
+tbl <- mlr_vdp_table(vdP_finalModel, meta_global) 
+tbl
+
+```
